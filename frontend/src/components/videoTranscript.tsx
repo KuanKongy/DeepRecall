@@ -12,6 +12,7 @@ export default function VideoTranscriptionApp() {
   const [video, setVideo] = useState<File | null>(null);
   const [summary, setSummary] = useState<string>("");
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
+  const [embeddings, setEmbeddings] = useState<number[][]>([]); // Store embeddings here
   const [query, setQuery] = useState<string>("");
   const [searchResult, setSearchResult] = useState<string>("");
   const [keywords, setKeywords] = useState<string>("");
@@ -29,11 +30,14 @@ export default function VideoTranscriptionApp() {
     formData.append("file", video);
     
     try {
-      console.log("sending");
+      console.log("Uploading video...");
       const response = await axios.post("http://127.0.0.1:5000/process_video", formData);
-      console.log(response);
+      
+      console.log("Response received:", response);
       setSummary(response.data.summary);
       setTranscript(response.data.transcript);
+      setEmbeddings(response.data.embeddings); // Store embeddings here
+
     } catch (error) {
       console.error("Upload failed", error);
     }
@@ -41,14 +45,20 @@ export default function VideoTranscriptionApp() {
   
   const handleSearch = async () => {
     if (!query) return;
+    if (embeddings.length === 0) {
+      console.error("Embeddings are missing! Make sure video is processed first.");
+      return;
+    }
+
     try {
-      console.log("sending");
+      console.log("Sending search query...");
       const response = await axios.post("http://127.0.0.1:5000/search", {
         query,
         search_index: transcript.map((seg) => seg.text),
-        embeddings: [] // Assuming backend can generate this internally
+        embeddings, // Pass stored embeddings
       });
-      console.log(response);
+
+      console.log("Search response:", response);
       setSearchResult(response.data.result);
     } catch (error) {
       console.error("Search failed", error);
