@@ -79,15 +79,14 @@ def create_search_index(transcript):
 def search_query(query, sentences, embeddings):
     """Finds relevant segments in transcript based on search query."""
     try:
-        # Ensure embeddings are valid
         if embeddings.shape[0] == 0:
             return "No matching results found."
 
         query_embedding = search_model.encode(query, convert_to_tensor=True)
-        
-        # Ensure query embedding size matches embeddings
-        if query_embedding.shape[0] != embeddings.shape[1]:  # (1, 384) vs (N, 384)
-            return "Query embedding size mismatch."
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        embeddings = embeddings.to(device)
+        query_embedding = query_embedding.to(device)
 
         scores = util.pytorch_cos_sim(query_embedding, embeddings)[0]
         top_match = sentences[scores.argmax().item()]
