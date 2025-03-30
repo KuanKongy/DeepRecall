@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Box, Button, Input, VStack, Textarea, Text } from "@chakra-ui/react";
+import { Box, Button, Input, VStack, Textarea, Text, Grid, GridItem, Heading } from "@chakra-ui/react";
 import axios from "axios";
 
 interface TranscriptSegment {
@@ -12,7 +12,7 @@ export default function VideoTranscriptionApp() {
   const [video, setVideo] = useState<File | null>(null);
   const [summary, setSummary] = useState<string>("");
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
-  const [embeddings, setEmbeddings] = useState<number[][]>([]); // Store embeddings here
+  const [embeddings, setEmbeddings] = useState<number[][]>([]);
   const [query, setQuery] = useState<string>("");
   const [searchResult, setSearchResult] = useState<string>("");
   const [keywords, setKeywords] = useState<string>("");
@@ -36,8 +36,7 @@ export default function VideoTranscriptionApp() {
       console.log("Response received:", response);
       setSummary(response.data.summary);
       setTranscript(response.data.transcript);
-      setEmbeddings(response.data.embeddings); // Store embeddings here
-
+      setEmbeddings(response.data.embeddings);
     } catch (error) {
       console.error("Upload failed", error);
     }
@@ -55,7 +54,7 @@ export default function VideoTranscriptionApp() {
       const response = await axios.post("http://127.0.0.1:5000/search", {
         query,
         search_index: transcript.map((seg) => seg.text),
-        embeddings, // Pass stored embeddings
+        embeddings,
       });
 
       console.log("Search response:", response);
@@ -79,46 +78,49 @@ export default function VideoTranscriptionApp() {
   };
 
   return (
-    <VStack p={5}>
-      <Box w="100%">
-        <Input type="file" onChange={handleFileChange} />
-        <Button mt={2} colorScheme="blue" onClick={handleUpload}>
-          Upload Video
-        </Button>
-      </Box>
-  
-      {summary && (
-        <Box w="100%" p={4} borderWidth={1} borderRadius="lg">
-          <Text fontSize="xl" fontWeight="bold">Summary</Text>
-          <Textarea value={summary} readOnly />
-        </Box>
-      )}
-  
-      {transcript.length > 0 && (
-        <Box w="100%" p={4} borderWidth={1} borderRadius="lg">
-          <Text fontSize="xl" fontWeight="bold">Search Transcript</Text>
-          <Input placeholder="Enter search term..." value={query} onChange={(e) => setQuery(e.target.value)} />
-          <Button mt={2} colorScheme="green" onClick={handleSearch}>
-            Search
+    <Box p={5} bgGradient="linear(to-r, purple.400, purple.600)" minH="100vh" color="white">
+      <Heading textAlign="center" mb={6}>Video Transcription & Search</Heading>
+      <Grid templateColumns={{ base: "1fr", md: "1fr 1fr" }} gap={6}>
+        <GridItem colSpan={2} p={5} bg="white" borderRadius="lg" color="black">
+          <Input type="file" onChange={handleFileChange} />
+          <Button mt={2} colorScheme="purple" onClick={handleUpload} width="full">
+            Upload Video
           </Button>
-          <Text mt={2}>{searchResult}</Text>
-        </Box>
-      )}
-  
-      {highlights.length > 0 && (
-        <Box w="100%" p={4} borderWidth={1} borderRadius="lg">
-          <Text fontSize="xl" fontWeight="bold">Keyword Highlights</Text>
-          <Input placeholder="Enter keywords (comma-separated)..." value={keywords} onChange={(e) => setKeywords(e.target.value)} />
-          <Button mt={2} colorScheme="purple" onClick={handleHighlightSearch}>
-            Highlight Keywords
-          </Button>
-          <VStack mt={2} align="start">
-            {highlights.map((highlight, index) => (
-              <Text key={index}>{`${highlight.start}s - ${highlight.end}s: ${highlight.text}`}</Text>
-            ))}
-          </VStack>
-        </Box>
-      )}
-    </VStack>
+        </GridItem>
+        
+        {summary && (
+          <GridItem p={5} bg="white" borderRadius="lg" color="black">
+            <Text fontSize="xl" fontWeight="bold">Summary</Text>
+            <Textarea value={summary} readOnly size="lg" />
+          </GridItem>
+        )}
+
+        {transcript.length > 0 && (
+          <GridItem p={5} bg="white" borderRadius="lg" color="black">
+            <Text fontSize="xl" fontWeight="bold">Search Transcript</Text>
+            <Input placeholder="Enter search term..." value={query} onChange={(e) => setQuery(e.target.value)} />
+            <Button mt={2} colorScheme="purple" onClick={handleSearch} width="full">
+              Search
+            </Button>
+            <Text mt={2}>{searchResult}</Text>
+          </GridItem>
+        )}
+
+        {transcript.length > 0 && (
+          <GridItem p={5} bg="white" borderRadius="lg" color="black">
+            <Text fontSize="xl" fontWeight="bold">Keyword Highlights</Text>
+            <Input placeholder="Enter keywords (comma-separated)..." value={keywords} onChange={(e) => setKeywords(e.target.value)} />
+            <Button mt={2} colorScheme="purple" onClick={handleHighlightSearch} width="full">
+              Highlight Keywords
+            </Button>
+            <VStack mt={2} align="start">
+              {highlights.map((highlight, index) => (
+                <Text key={index}>{`${highlight.start}s - ${highlight.end}s: ${highlight.text}`}</Text>
+              ))}
+            </VStack>
+          </GridItem>
+        )}
+      </Grid>
+    </Box>
   );  
 }
