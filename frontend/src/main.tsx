@@ -1,12 +1,5 @@
-import React from "react";
-import ReactDOM from "react-dom/client";
-import { ChakraProvider, defaultSystem } from "@chakra-ui/react";
-import VideoTranscriptionApp from "./components/videoTranscript";
+import { createRoot } from 'react-dom/client'
+import App from './App.tsx'
+import './index.css'
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <ChakraProvider value={defaultSystem}>
-      <VideoTranscriptionApp />
-    </ChakraProvider>
-  </React.StrictMode>
-);
+createRoot(document.getElementById("root")!).render(<App />);
