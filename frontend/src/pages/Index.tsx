@@ -8,7 +8,7 @@ import { Upload, Search, PlayCircle, ListFilter, Sun, Moon, FileVideo } from "lu
 import { useToast } from "@/components/ui/use-toast";
 import { useTheme } from "@/components/ThemeProvider";
 import axios from "axios";
-const SERVER_URL = "https://deeprecall.onrender.com"; //http://127.0.0.1:5000 https://deeprecall.onrender.com
+const SERVER_URL = "https://deeprecall.onrender.com"; //http://127.0.0.1:5000
 
 interface TranscriptSegment {
   start: number;
