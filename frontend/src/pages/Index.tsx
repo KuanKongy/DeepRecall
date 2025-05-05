@@ -8,6 +8,7 @@ import { Upload, Search, PlayCircle, ListFilter, Sun, Moon, FileVideo } from "lu
 import { useToast } from "@/components/ui/use-toast";
 import { useTheme } from "@/components/ThemeProvider";
 import axios from "axios";
+const SERVER_URL = "https://deeprecall.onrender.com"; //http://127.0.0.1:5000 https://deeprecall.onrender.com
 
 interface TranscriptSegment {
   start: number;
@@ -63,7 +64,7 @@ const Index = () => {
     
     try {
       console.log("Uploading video...");
-      const response = await axios.post("http://127.0.0.1:5000/process_video", formData);
+      const response = await axios.post(SERVER_URL+"/process_video", formData);
       console.log(response.data);
       setSummary(response.data.summary);
       setTranscript(response.data.transcript);
@@ -107,7 +108,7 @@ const Index = () => {
     setLoading(true);
     try {
       console.log("Requesting search...");
-      const response = await axios.post("http://127.0.0.1:5000/search", {
+      const response = await axios.post(SERVER_URL+"/search", {
         query,
         search_index: transcript.map((seg) => seg.text),
         embeddings,
@@ -153,7 +154,7 @@ const Index = () => {
     setLoading(true);
     try {
       console.log("Requesting highlights...");
-      const response = await axios.post("http://127.0.0.1:5000/highlights", {
+      const response = await axios.post(SERVER_URL+"/highlights", {
         transcript,
         keywords: keywords.split(",").map((k) => k.trim())
       });
