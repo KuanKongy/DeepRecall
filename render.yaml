@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: whisper-api
+    runtime: python
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: OPENAI_API_KEY
+      - key: REDIS_URL
+    plan: free
