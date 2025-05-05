@@ -1,12 +1,13 @@
 services:
   - type: web
-    name: whisper-api
+    name: whisper-transcriber
     runtime: python
-    buildCommand: |
-      apt-get update && apt-get install -y ffmpeg
-      pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:
       - key: OPENAI_API_KEY
+      - key: CACHE_TYPE
+        value: redis
+      - key: CACHE_REDIS_URL
       - key: REDIS_URL
     plan: free
