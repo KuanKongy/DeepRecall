@@ -1,0 +1,14 @@
+include:
+   - redis-docker-compose.yaml
+services:
+  server:
+    build:
+      context: .
+    ports:
+      - 10000:10000
+    env_file:
+      - .env
+    develop:
+      watch:
+        - action: rebuild
+          path: .

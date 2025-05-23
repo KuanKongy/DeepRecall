@@ -43,6 +43,7 @@ if not openai.api_key:
 # Load Whisper model
 try:
     model = whisper.load_model("base")
+    print(f"Whisper device: {model.device}")
     print("Whisper model loaded successfully.")
 except Exception as e:
     print(f"Error loading Whisper model: {e}")
@@ -50,7 +51,8 @@ except Exception as e:
 
 
 # Load Sentence Transformer for search
-search_model = SentenceTransformer("all-MiniLM-L6-v2")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+search_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
 
 
 def get_video_hash(video_path):
@@ -222,7 +224,7 @@ def process_video():
             transcript = transcribe_audio_with_timestamps(video_path)
             if not transcript:
                 return jsonify({"error": "Failed to transcribe video."}), 500
-            redis_client.setex(f"transcript:{video_hash}", 3600, str(transcript))
+            redis_client.setex(f"transcript:{video_hash}", 86400, str(transcript))
 
         text_content = " ".join([seg['text'] for seg in transcript])
         
@@ -235,7 +237,7 @@ def process_video():
         else:
             short_summary, detailed_summary = summarize_text(text_content)
             summary = {"short": short_summary, "detailed": detailed_summary}
-            redis_client.setex(f"summary:{video_hash}", 3600, str(summary))
+            redis_client.setex(f"summary:{video_hash}", 86400, str(summary))
 
         sentences, embeddings = create_search_index(transcript)
 
@@ -275,7 +277,8 @@ def search():
             print("❌ No embeddings found. Returning error.")
             return jsonify({"error": "Embeddings missing from request."}), 400
 
-        embeddings = torch.tensor(embeddings)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        embeddings = torch.tensor(embeddings).to(device)
 
         result = search_query(query, sentences, embeddings)
         return jsonify({"result": result})
@@ -313,7 +316,12 @@ def common():
         print(f"Error extracting commons: {e}")
         return jsonify({"error": "Failed to extract commons."}), 500
 
+@app.route("/")
+def hello_world():
+    print(torch.cuda.is_available())
+    print(f"Whisper device: {model.device}")
+    return "<h1>Hello, Docker boiii2 !!! </h1>"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True, host="0.0.0.0", port=port)

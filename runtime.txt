@@ -1,1 +1,20 @@
 python-3.10.13
+
+services:
+  redis:
+    image: redis:7.2.7
+    container_name: redis
+    restart: always
+    volumes:
+      - redis_volume_data:/data
+  redis_insight:
+    image: redislabs/redisinsight:2.68.0
+    container_name: redis_insight
+    restart: always
+    volumes:
+      - redis_insight_volume_data:/db
+
+volumes:
+  redis_volume_data:
+  redis_insight_volume_data:
+  
