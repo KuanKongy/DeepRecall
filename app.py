@@ -2,26 +2,81 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import openai
 import os
+import sys
 import glob
+import hmac
+import time
+import platform
+import importlib.util
 import ffmpeg
 import redis
 import hashlib
 import tiktoken
 import json
 import tempfile
+import threading
 import numpy as np
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 
 app = Flask(__name__)
-CORS(app)
-
-
-redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-redis_client = redis.from_url(redis_url)
+CORS(app, origins=os.getenv("CORS_ORIGINS", "*").split(","))
+# Oversized uploads get a 413 instead of filling the disk.
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_CONTENT_LENGTH", str(2 * 1024**3)))
 
 CACHE_TTL = 86400
+
+
+class MemoryCache:
+    """In-process stand-in for Redis when REDIS_URL is unset (local dev / Mac
+    GPU mode). Single-process only — matches the gunicorn --workers 1 setup."""
+
+    def __init__(self):
+        self._data = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _to_bytes(value):
+        # Redis returns bytes; coerce on write so callers see identical types
+        # (json.loads and np.frombuffer both accept bytes).
+        return value if isinstance(value, bytes) else str(value).encode()
+
+    def get(self, key):
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            value, expires_at = entry
+            if time.time() > expires_at:
+                del self._data[key]
+                return None
+            return value
+
+    def setex(self, key, ttl, value):
+        with self._lock:
+            self._data[key] = (self._to_bytes(value), time.time() + ttl)
+
+    def exists(self, key):
+        return 1 if self.get(key) is not None else 0
+
+    def delete(self, key):
+        with self._lock:
+            self._data.pop(key, None)
+
+    def ping(self):
+        return True
+
+
+def make_cache():
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        # Upstash hands out rediss:// TLS URLs; redis-py handles them natively.
+        return redis.from_url(redis_url), "redis"
+    return MemoryCache(), "memory"
+
+
+cache, CACHE_MODE = make_cache()
 
 
 # Load OpenAI API key
@@ -31,17 +86,50 @@ if not openai.api_key:
 
 openai_client = openai.OpenAI(api_key=openai.api_key)
 
-SUMMARY_MODEL = "gpt-4o-mini"
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-4o-mini")
 EMBEDDING_MODEL = "text-embedding-3-small"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 GROQ_CHUNK_SECONDS = 600  # 10-minute chunks transcribed in parallel
 GROQ_MAX_WORKERS = 6      # stays under Groq free-tier rate limits
 
-# Transcription backend: "groq" (API, fastest), "mlx" (Apple Silicon GPU),
-# "local" (faster-whisper on CPU). Overridable per request via the "backend"
-# form field on /process_video.
-DEFAULT_BACKEND = os.getenv("TRANSCRIBE_BACKEND", "groq").lower()
-VALID_BACKENDS = ("groq", "mlx", "local")
+
+def detect_backends():
+    """Discover which transcription backends can run here. Uses find_spec, not
+    a real import: importing mlx_whisper would load the MLX runtime at boot."""
+    backends = []
+    if os.getenv("GROQ_API_KEY"):
+        backends.append("groq")
+    if (
+        sys.platform == "darwin"
+        and platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx_whisper")
+    ):
+        backends.append("mlx")
+    if importlib.util.find_spec("faster_whisper"):
+        backends.append("local")
+    return tuple(backends)
+
+
+AVAILABLE_BACKENDS = detect_backends()
+
+_requested_backend = os.getenv("TRANSCRIBE_BACKEND", "groq").lower()
+DEFAULT_BACKEND = (
+    _requested_backend
+    if _requested_backend in AVAILABLE_BACKENDS
+    else (AVAILABLE_BACKENDS[0] if AVAILABLE_BACKENDS else None)
+)
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+
+@app.before_request
+def require_password():
+    """Shared-password gate; an unset APP_PASSWORD disables it (local dev)."""
+    if not APP_PASSWORD or request.method == "OPTIONS" or request.path in ("/", "/health"):
+        return None
+    if not hmac.compare_digest(request.headers.get("X-App-Password", ""), APP_PASSWORD):
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
 
 
 def get_groq_client():
@@ -244,7 +332,7 @@ def summarize_text(text):
 
 
 def create_search_index(transcript, cache_key):
-    """Embeds transcript sentences via the OpenAI API and caches them in Redis."""
+    """Embeds transcript sentences via the OpenAI API and caches them."""
     sentences = [seg["text"] for seg in transcript if seg["text"].strip()]
     if not sentences:
         print("⚠️ No sentences found for embedding generation.")
@@ -258,12 +346,12 @@ def create_search_index(transcript, cache_key):
         embeddings.extend(item.embedding for item in response.data)
 
     vectors = np.array(embeddings, dtype=np.float32)
-    redis_client.setex(
+    cache.setex(
         f"search:{cache_key}",
         CACHE_TTL,
         json.dumps({"sentences": sentences, "dim": vectors.shape[1]}),
     )
-    redis_client.setex(f"searchvec:{cache_key}", CACHE_TTL, vectors.tobytes())
+    cache.setex(f"searchvec:{cache_key}", CACHE_TTL, vectors.tobytes())
     print(f"✅ Generated {len(sentences)} embeddings.")
     return True
 
@@ -290,9 +378,12 @@ def process_video():
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded."}), 400
 
-    backend = (request.form.get("backend") or DEFAULT_BACKEND).lower()
-    if backend not in VALID_BACKENDS:
-        return jsonify({"error": f"Unknown backend '{backend}'. Valid: {', '.join(VALID_BACKENDS)}"}), 400
+    backend = (request.form.get("backend") or DEFAULT_BACKEND or "").lower()
+    if backend not in AVAILABLE_BACKENDS:
+        return jsonify({
+            "error": f"Backend '{backend}' is not available on this server. "
+                     f"Available: {', '.join(AVAILABLE_BACKENDS) or 'none'}"
+        }), 400
 
     try:
         with tempfile.TemporaryDirectory() as workdir:
@@ -303,28 +394,28 @@ def process_video():
             # Cache keys include the backend so a local transcript never masks an API one
             video_key = f"{get_video_hash(video_path)}:{backend}"
 
-            cached_transcript = redis_client.get(f"transcript:{video_key}")
+            cached_transcript = cache.get(f"transcript:{video_key}")
             if cached_transcript:
-                print("✅ Using cached transcription from Redis.")
+                print("✅ Using cached transcription.")
                 transcript = json.loads(cached_transcript)
             else:
                 transcript = transcribe_audio_with_timestamps(video_path, backend, workdir)
                 if not transcript:
                     return jsonify({"error": "Failed to transcribe video."}), 500
-                redis_client.setex(f"transcript:{video_key}", CACHE_TTL, json.dumps(transcript))
+                cache.setex(f"transcript:{video_key}", CACHE_TTL, json.dumps(transcript))
 
         text_content = " ".join(seg['text'] for seg in transcript)
 
-        cached_summary = redis_client.get(f"summary:{video_key}")
+        cached_summary = cache.get(f"summary:{video_key}")
         if cached_summary:
-            print("✅ Using cached summary from Redis.")
+            print("✅ Using cached summary.")
             summary = json.loads(cached_summary)
         else:
             short_summary, detailed_summary = summarize_text(text_content)
             summary = {"short": short_summary, "detailed": detailed_summary}
-            redis_client.setex(f"summary:{video_key}", CACHE_TTL, json.dumps(summary))
+            cache.setex(f"summary:{video_key}", CACHE_TTL, json.dumps(summary))
 
-        if not redis_client.exists(f"searchvec:{video_key}"):
+        if not cache.exists(f"searchvec:{video_key}"):
             if not create_search_index(transcript, video_key):
                 return jsonify({"error": "Failed to generate embeddings."}), 500
 
@@ -353,8 +444,8 @@ def search():
         if not video_key:
             return jsonify({"error": "video_hash is required. Process a video first."}), 400
 
-        meta = redis_client.get(f"search:{video_key}")
-        vector_bytes = redis_client.get(f"searchvec:{video_key}")
+        meta = cache.get(f"search:{video_key}")
+        vector_bytes = cache.get(f"searchvec:{video_key}")
         if not meta or not vector_bytes:
             return jsonify({"error": "Search index expired. Please re-process the video."}), 404
 
@@ -394,6 +485,23 @@ def common():
     except Exception as e:
         print(f"Error extracting commons: {e}")
         return jsonify({"error": "Failed to extract commons."}), 500
+
+
+@app.route("/health")
+def health():
+    redis_ok = False
+    if CACHE_MODE == "redis":
+        try:
+            redis_ok = bool(cache.ping())
+        except Exception:
+            redis_ok = False
+    return jsonify({
+        "ok": bool(AVAILABLE_BACKENDS),
+        "cache": CACHE_MODE,
+        "redis": redis_ok,
+        "default_backend": DEFAULT_BACKEND,
+        "available_backends": list(AVAILABLE_BACKENDS),
+    })
 
 
 @app.route("/")

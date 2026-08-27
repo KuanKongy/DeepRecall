@@ -1,24 +1,68 @@
-# Project Description
+# DeepRecall
 
-DeepRecall is a Flask-based AI API that turns videos into structured, searchable knowledge by transcribing, summarizing, and indexing content with state-of-the-art machine learning models. Whether you're analyzing lecture recordings, meetings, or educational content, DeepRecall helps you find key moments instantly with semantic search and caching.
+DeepRecall turns lecture videos into searchable knowledge. Upload an MP4 and it
+transcribes the audio, writes a short and a detailed summary, and builds a
+semantic search index over the transcript — cached by the video's SHA-256 so a
+video is only ever processed once.
 
-## Project info
+The server is a thin orchestrator: transcription runs on Groq
+(`whisper-large-v3-turbo`), or locally via MLX (Apple Silicon GPU) or
+faster-whisper (CPU); summaries and embeddings use the OpenAI API; the cache is
+Redis (Upstash in production) with an in-process fallback for local dev.
 
-**URL**: https://www.youtube.com/watch?v=F3tVI8lyPAw
+## Architecture
 
-## 🛠 How We Built It
-### Backend (Flask-based RESTful API):
-- Flask & Flask-CORS for API development.
-- OpenAI Whisper for speech-to-text transcription.
-- GPT-4 for summarization.
-- Sentence Transformers for semantic search with cosine similarity.
-- Redis caching to store transcripts & summaries.
-- FFmpeg for extracting audio from video files.
-- PyTorch for handling embeddings and search.
+- `app.py` — Flask API served by gunicorn (Docker, deployed on Railway)
+- `frontend/` — React/Vite UI, deployed to GitHub Pages from the `gh-pages` branch
+- Cache — Upstash Redis via `REDIS_URL`; without it, an in-memory cache
 
-## Dependencies: 
-- You need to download python3.10
-- Put into terminal: pip3.10 flask openai-whisper openai ffmpeg-python sentence-transformers torch redis tiktoken flask_caching hashlib
+## Configuration
 
-## To Run
-Put into terminal: python3.10 app.py
+Copy `.env.sample` to `.env` and fill in:
+
+| Variable | Meaning |
+|---|---|
+| `OPENAI_API_KEY` | Required — summaries and embeddings |
+| `GROQ_API_KEY` | Enables the `groq` transcription backend |
+| `TRANSCRIBE_BACKEND` | `groq` (default), `mlx`, or `local` |
+| `SUMMARY_MODEL` | Chat model for summaries (default `gpt-4.1-nano`) |
+| `REDIS_URL` | Optional; `rediss://…` from Upstash. Unset = memory cache |
+| `APP_PASSWORD` | Optional shared password (clients send `X-App-Password`) |
+| `CORS_ORIGINS` | Comma-separated origin allowlist |
+
+`GET /health` reports the active cache and which backends are available.
+
+## Run locally (Groq backend)
+
+```sh
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+TRANSCRIBE_BACKEND=groq python app.py        # http://127.0.0.1:10000
+cd frontend && npm install && npm run dev    # http://localhost:8080
+```
+
+No `REDIS_URL` needed — results cache in process.
+
+## Run on your Mac with the GPU (MLX)
+
+```sh
+pip install -r requirements.txt -r requirements-mac.txt   # Apple Silicon only
+TRANSCRIBE_BACKEND=mlx python app.py
+```
+
+The first run downloads ~1.6 GB of Whisper weights to `~/.cache/huggingface`.
+The hosted UI can also target a Mac backend: set the server URL to
+`http://localhost:10000` in the UI settings.
+
+## Deploy
+
+- **API**: Railway builds the root `Dockerfile` on push (`railway.toml` sets the
+  `/health` healthcheck). Set the variables above in the Railway service, plus
+  `REDIS_URL` from an Upstash Redis database in the same region.
+- **Frontend**: `cd frontend && npm run deploy` publishes to GitHub Pages.
+  `frontend/.env.production` holds the Railway domain.
+
+## Local Docker
+
+`docker compose up --build` runs the API plus a local Redis
+(`compose.yaml` + `redis-docker-compose.yaml`).
