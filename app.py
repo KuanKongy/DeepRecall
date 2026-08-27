@@ -20,7 +20,7 @@ import json
 import tempfile
 import threading
 import numpy as np
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -229,8 +229,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir):
 
         _update_job(job_id, stage="summarizing", progress=None, message="Summarizing")
         if not cache.get(f"summary:{video_key}"):
-            text_content = " ".join(seg["text"] for seg in transcript)
-            short_summary, detailed_summary = summarize_text(text_content)
+            short_summary, detailed_summary = summarize_text(transcript)
             cache.setex(
                 f"summary:{video_key}",
                 CACHE_TTL,
@@ -446,24 +445,43 @@ def _chat(system_prompt, text):
     return response.choices[0].message.content.strip()
 
 
-def summarize_text(text):
+def _fmt_ts(seconds):
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def summarize_text(transcript):
     """Generates a short and a detailed summary, running API calls in parallel.
-    gpt-4.1-nano's 1M-token context takes any real lecture in a single pass."""
-    n_tokens = len(tiktoken.get_encoding("cl100k_base").encode(text))
+    gpt-4.1-nano's 1M-token context takes any real lecture in a single pass.
+    The transcript is fed as [mm:ss]-stamped lines so the detailed summary can
+    cite timestamps in its Key moments section."""
+    stamped = "\n".join(
+        f"[{_fmt_ts(seg['start'])}] {seg['text'].strip()}" for seg in transcript
+    )
+    n_tokens = len(tiktoken.get_encoding("cl100k_base").encode(stamped))
     if n_tokens > 800000:
         raise RuntimeError(f"Transcript too long to summarize ({n_tokens} tokens).")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         detailed_future = pool.submit(
             _chat,
-            "Create a structured, detailed summary of the following lecture transcript. "
-            "Ensure it includes all key points, organized in sections. Use bullet points where necessary.",
-            text,
+            "Create a structured, detailed summary in Markdown of the following lecture "
+            "transcript. Each line is prefixed with its [mm:ss] timestamp. Organize the "
+            "key points into sections with '##' headings, using bullet points where "
+            "helpful, and finish with a '## Key moments' section listing the most "
+            "important moments as '- [mm:ss] description' with timestamps taken from "
+            "the transcript.",
+            stamped,
         )
         short_future = pool.submit(
             _chat,
-            "Provide a very brief high-level summary of the following lecture in under 300 words.",
-            text,
+            "Provide a very brief high-level summary of the following lecture in under "
+            "300 words of plain prose. Ignore the [mm:ss] timestamps.",
+            stamped,
         )
         return short_future.result(), detailed_future.result()
 
@@ -571,11 +589,6 @@ def search_query(query, meta, vectors):
     return scores
 
 
-def extract_highlights(transcript, keywords):
-    """Extracts highlighted sections based on keywords."""
-    return [seg for seg in transcript if any(keyword.lower() in seg['text'].lower() for keyword in keywords)]
-
-
 _UPLOAD_EXTS = {".mp4", ".m4a", ".mp3", ".wav", ".mov", ".webm", ".mkv", ".aac", ".ogg", ".flac"}
 
 
@@ -681,45 +694,35 @@ def search():
         if not video_key:
             return jsonify({"error": "video_hash is required. Process a video first."}), 400
 
+        try:
+            k = int(data.get("k", 5))
+        except (TypeError, ValueError):
+            k = 5
+        k = max(1, min(20, k))
+
         loaded = _load_index(video_key)
         if loaded is None:
             return jsonify({"error": "Search index expired. Please re-process the video."}), 404
         meta, vectors = loaded
 
         scores = search_query(query, meta, vectors)
-        best = int(np.argmax(scores))
-        return jsonify({"result": meta["sentences"][best]})
+        # Indexes cached before windowing carry no timestamps.
+        starts = meta.get("starts")
+        ends = meta.get("ends")
+        order = np.argsort(scores)[::-1][:k]
+        results = [
+            {
+                "text": meta["sentences"][i],
+                "start": starts[i] if starts else None,
+                "end": ends[i] if ends else None,
+                "score": float(scores[i]),
+            }
+            for i in (int(x) for x in order)
+        ]
+        return jsonify({"results": results})
     except Exception as e:
         print(f"❌ Error handling search: {e}")
         return jsonify({"error": "Search failed."}), 500
-
-
-@app.route('/highlights', methods=['POST'])
-def highlights():
-    """Extracts highlighted segments based on keywords."""
-    try:
-        data = request.json
-        transcript = data.get("transcript", [])
-        keywords = data.get("keywords", [])
-        highlights = extract_highlights(transcript, keywords)
-        return jsonify({"highlights": highlights})
-    except Exception as e:
-        print(f"Error extracting highlights: {e}")
-        return jsonify({"error": "Failed to extract highlights."}), 500
-
-
-@app.route('/common', methods=['POST'])
-def common():
-    """Extracts common keywords"""
-    try:
-        data = request.json
-        transcript = data.get("transcript", [])
-        words = " ".join(seg['text'] for seg in transcript).lower().split()
-        common_words = Counter(words).most_common(5)
-        return jsonify({"Common keywords": common_words})
-    except Exception as e:
-        print(f"Error extracting commons: {e}")
-        return jsonify({"error": "Failed to extract commons."}), 500
 
 
 @app.route("/health")

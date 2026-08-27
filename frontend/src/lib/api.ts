@@ -2,7 +2,47 @@ import axios from "axios";
 
 export const DEFAULT_API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:10000";
 
-export const api = axios.create({ baseURL: DEFAULT_API });
+const SETTINGS_KEY = "deeprecall-settings";
+
+export interface ApiSettings {
+  apiUrl: string;
+  password: string;
+}
+
+export function loadSettings(): ApiSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        apiUrl: parsed.apiUrl || DEFAULT_API,
+        password: parsed.password || "",
+      };
+    }
+  } catch {
+    /* storage unavailable or corrupt — fall through to defaults */
+  }
+  return { apiUrl: DEFAULT_API, password: "" };
+}
+
+export function saveSettings(settings: ApiSettings): void {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    /* private browsing etc. — settings just won't persist */
+  }
+}
+
+// Base URL and password are read per request so the settings popover takes
+// effect immediately. This also lets the hosted UI target a Mac backend at
+// http://localhost:10000 (exempt from mixed-content blocking in Chrome/Firefox).
+export const api = axios.create();
+api.interceptors.request.use((config) => {
+  const settings = loadSettings();
+  config.baseURL = settings.apiUrl;
+  if (settings.password) config.headers["X-App-Password"] = settings.password;
+  return config;
+});
 
 export interface TranscriptSegment {
   start: number;
@@ -55,6 +95,19 @@ export interface CacheMiss {
 
 export type CacheLookup = CacheHit | CacheMiss;
 
+export interface SearchHit {
+  text: string;
+  start: number | null;
+  end: number | null;
+  score: number;
+}
+
+export interface SubmitResult {
+  job_id: string;
+  video_hash: string;
+  deduplicated: boolean;
+}
+
 export async function getHealth(): Promise<HealthInfo> {
   try {
     return (await api.get<HealthInfo>("/health")).data;
@@ -74,12 +127,6 @@ export async function lookupCache(sha256: string, backend: string): Promise<Cach
     }
     throw err;
   }
-}
-
-export interface SubmitResult {
-  job_id: string;
-  video_hash: string;
-  deduplicated: boolean;
 }
 
 export async function submitMedia(
@@ -105,6 +152,15 @@ export async function getJob(jobId: string): Promise<JobRecord> {
   return (await api.get<JobRecord>(`/jobs/${jobId}`)).data;
 }
 
-export async function searchTranscript(query: string, videoHash: string) {
-  return (await api.post("/search", { query, video_hash: videoHash })).data;
+export async function searchTranscript(
+  query: string,
+  videoHash: string,
+  k = 5,
+): Promise<SearchHit[]> {
+  const res = await api.post<{ results: SearchHit[] }>("/search", {
+    query,
+    video_hash: videoHash,
+    k,
+  });
+  return res.data.results;
 }
