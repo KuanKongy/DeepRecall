@@ -1,0 +1,8 @@
+.env
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+*.mp4
+*.wav
+frontend/dist/
