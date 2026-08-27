@@ -1,34 +1,97 @@
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Upload, Search, PlayCircle, ListFilter, Sun, Moon, FileVideo } from "lucide-react";
+import { Search, PlayCircle, ListFilter, Sun, Moon, FileVideo } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
 import { useTheme } from "@/components/ThemeProvider";
-import axios from "axios";
-const SERVER_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:10000";
+import {
+  api,
+  getHealth,
+  getJob,
+  lookupCache,
+  searchTranscript,
+  submitMedia,
+  type CacheHit,
+  type HealthInfo,
+  type JobRecord,
+  type Summary,
+  type TranscriptSegment,
+} from "@/lib/api";
+import { hashFile } from "@/lib/hashFile";
+import { extractAudio } from "@/lib/extractAudio";
 
-interface TranscriptSegment {
-  start: number;
-  end: number;
-  text: string;
+const BACKEND_LABELS: Record<string, string> = {
+  groq: "API — fast (Groq)",
+  mlx: "Local — MacBook GPU (MLX)",
+  local: "Local — CPU (faster-whisper)",
+};
+
+// Railway closes request bodies that take longer than 5 minutes to upload.
+const RAW_UPLOAD_WARN_BYTES = 300 * 1024 * 1024;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+interface StageInfo {
+  label: string;
+  fraction: number | null;
+  detail: string | null;
+}
+
+function describeJob(job: JobRecord): StageInfo {
+  switch (job.stage) {
+    case "queued":
+      return { label: "Queued on server", fraction: null, detail: null };
+    case "extracting":
+      return { label: "Extracting audio (server)", fraction: null, detail: null };
+    case "transcribing":
+      if (job.progress && job.progress.total > 0) {
+        return {
+          label: "Transcribing",
+          fraction: job.progress.current / job.progress.total,
+          detail: `${job.progress.current}/${job.progress.total}`,
+        };
+      }
+      return { label: "Transcribing", fraction: null, detail: null };
+    case "summarizing":
+      return { label: "Summarizing", fraction: null, detail: null };
+    case "indexing":
+      return { label: "Building search index", fraction: null, detail: null };
+    default:
+      return { label: job.message || job.stage, fraction: null, detail: null };
+  }
 }
 
 const Index = () => {
   const [video, setVideo] = useState<File | null>(null);
-  const [summary, setSummary] = useState<any>("");
+  const [summary, setSummary] = useState<Summary | null>(null);
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
   const [videoHash, setVideoHash] = useState<string>("");
-  const [backend, setBackend] = useState<"groq" | "mlx" | "local">("groq");
+  const [health, setHealth] = useState<HealthInfo | null>(null);
+  const [backend, setBackend] = useState<string>("groq");
   const [query, setQuery] = useState<string>("");
   const [searchResult, setSearchResult] = useState<string>("");
   const [keywords, setKeywords] = useState<string>("");
   const [highlights, setHighlights] = useState<TranscriptSegment[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
+  const [stage, setStage] = useState<StageInfo | null>(null);
+  const hashPromiseRef = useRef<Promise<string> | null>(null);
   const { toast } = useToast();
   const { theme, setTheme } = useTheme();
+
+  useEffect(() => {
+    getHealth()
+      .then((info) => {
+        setHealth(info);
+        if (info.default_backend) setBackend(info.default_backend);
+      })
+      .catch(() => setHealth(null));
+  }, []);
+
+  const serverReady = health !== null && health.ok;
+  const backendChoices = health?.available_backends ?? [];
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files.length > 0) {
@@ -42,10 +105,31 @@ const Index = () => {
         return;
       }
       setVideo(file);
+      // Start hashing immediately so it is usually done before Process is clicked.
+      hashPromiseRef.current = hashFile(file);
+      hashPromiseRef.current.catch(() => undefined);
       toast({
         title: "Video selected",
-        description: `${file.name} is ready to be uploaded.`,
+        description: `${file.name} is ready to be processed.`,
       });
+    }
+  };
+
+  const applyResult = (hit: CacheHit) => {
+    setSummary(hit.summary);
+    setTranscript(hit.transcript);
+    setVideoHash(hit.video_hash);
+  };
+
+  const pollJob = async (jobId: string): Promise<void> => {
+    for (;;) {
+      const job = await getJob(jobId);
+      if (job.status === "error") {
+        throw new Error(job.error ?? "Processing failed.");
+      }
+      if (job.status === "done") return;
+      setStage(describeJob(job));
+      await sleep(2000);
     }
   };
 
@@ -58,36 +142,87 @@ const Index = () => {
       });
       return;
     }
-    
-    setLoading(true);
-    const formData = new FormData();
-    formData.append("file", video);
-    formData.append("backend", backend);
 
+    setLoading(true);
     try {
-      console.log("Uploading video...");
-      const response = await axios.post(SERVER_URL+"/process_video", formData);
-      console.log(response.data);
-      setSummary(response.data.summary);
-      setTranscript(response.data.transcript);
-      setVideoHash(response.data.video_hash);
-      setLoading(false);
+      setStage({ label: "Hashing", fraction: null, detail: null });
+      const sha = await (hashPromiseRef.current ?? hashFile(video));
+
+      setStage({ label: "Checking cache", fraction: null, detail: null });
+      const lookup = await lookupCache(sha, backend);
+
+      if (lookup.cached === true) {
+        applyResult(lookup);
+        toast({
+          title: "Already processed",
+          description: "Loaded the cached results for this video — no upload needed.",
+        });
+        return;
+      }
+
+      let jobId = lookup.job_id;
+      if (!jobId) {
+        // Demux the audio track in the browser; fall back to the raw video.
+        let payload: Blob = video;
+        let filename = video.name;
+        let clientHash: string | null = null;
+        setStage({ label: "Extracting audio in browser", fraction: null, detail: null });
+        try {
+          payload = await extractAudio(video);
+          filename = "audio.m4a";
+          clientHash = sha;
+        } catch (err) {
+          console.warn("Browser audio extraction failed; uploading the raw video.", err);
+          if (video.size > RAW_UPLOAD_WARN_BYTES) {
+            toast({
+              title: "Uploading the full video",
+              description:
+                "Audio extraction failed in this browser, and the video is large — the upload may time out.",
+            });
+          }
+        }
+
+        setStage({ label: "Uploading", fraction: 0, detail: null });
+        const submitted = await submitMedia(payload, filename, backend, clientHash, (fraction) =>
+          setStage({
+            label: "Uploading",
+            fraction,
+            detail: `${Math.round(fraction * 100)}%`,
+          }),
+        );
+        jobId = submitted.job_id;
+      } else {
+        toast({
+          title: "Processing already in progress",
+          description: "This video is being processed — attaching to the running job.",
+        });
+      }
+
+      await pollJob(jobId);
+
+      const finished = await lookupCache(sha, backend);
+      if (finished.cached === true) {
+        applyResult(finished);
+      } else {
+        throw new Error("Processing finished but the results are missing from the cache.");
+      }
       toast({
         title: "Video processed successfully",
         description: "Your video has been analyzed and the results are ready.",
       });
-
     } catch (error) {
-      console.error("Upload failed", error);
-      setLoading(false);
+      console.error("Processing failed", error);
       toast({
-        title: "Upload failed",
-        description: "There was an error processing your video.",
+        title: "Processing failed",
+        description: error instanceof Error ? error.message : "There was an error processing your video.",
         variant: "destructive",
       });
+    } finally {
+      setLoading(false);
+      setStage(null);
     }
   };
-  
+
   const handleSearch = async () => {
     if (!query) {
       toast({
@@ -109,27 +244,21 @@ const Index = () => {
 
     setLoading(true);
     try {
-      console.log("Requesting search...");
-      const response = await axios.post(SERVER_URL+"/search", {
-        query,
-        video_hash: videoHash,
-      });
-      console.log(response.data.result);
-      setSearchResult(response.data.result);
-      setLoading(false);
+      const data = await searchTranscript(query, videoHash);
+      setSearchResult(data.result);
       toast({
         title: "Search completed",
         description: "Search results are now available.",
       });
-
     } catch (error) {
       console.error("Search failed", error);
-      setLoading(false);
       toast({
         title: "Search failed",
         description: "There was an error processing your search query.",
         variant: "destructive",
       });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -154,27 +283,24 @@ const Index = () => {
     
     setLoading(true);
     try {
-      console.log("Requesting highlights...");
-      const response = await axios.post(SERVER_URL+"/highlights", {
+      const response = await api.post("/highlights", {
         transcript,
-        keywords: keywords.split(",").map((k) => k.trim())
+        keywords: keywords.split(",").map((k) => k.trim()),
       });
-      console.log(response.data.highlights);
       setHighlights(response.data.highlights);
-      setLoading(false);
       toast({
         title: "Highlights generated",
         description: "Keyword highlights are now available.",
       });
-    
     } catch (error) {
       console.error("Highlight search failed", error);
-      setLoading(false);
       toast({
         title: "Highlight search failed",
         description: "There was an error processing your highlight request.",
         variant: "destructive",
       });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -229,27 +355,54 @@ const Index = () => {
                       </p>
                     )}
                   </div>
-                  <div className="grid w-full max-w-sm items-center gap-1.5">
-                    <label htmlFor="backend-select" className="text-sm text-gray-700 dark:text-gray-300">
-                      Processing mode
-                    </label>
-                    <select
-                      id="backend-select"
-                      value={backend}
-                      onChange={(e) => setBackend(e.target.value as "groq" | "mlx" | "local")}
-                      className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm cursor-pointer"
-                    >
-                      <option value="groq">API — fast (Groq)</option>
-                      <option value="mlx">Local — MacBook GPU (MLX)</option>
-                      <option value="local">Local — CPU (faster-whisper)</option>
-                    </select>
-                  </div>
+                  {backendChoices.length > 1 && (
+                    <div className="grid w-full max-w-sm items-center gap-1.5">
+                      <label htmlFor="backend-select" className="text-sm text-gray-700 dark:text-gray-300">
+                        Processing mode
+                      </label>
+                      <select
+                        id="backend-select"
+                        value={backend}
+                        onChange={(e) => setBackend(e.target.value)}
+                        className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm cursor-pointer"
+                      >
+                        {backendChoices.map((choice) => (
+                          <option key={choice} value={choice}>
+                            {BACKEND_LABELS[choice] ?? choice}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                  {health === null && (
+                    <p className="text-sm text-red-600 dark:text-red-400">
+                      Server unreachable — check that the API is running.
+                    </p>
+                  )}
+                  {stage && (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs text-gray-600 dark:text-gray-300">
+                        <span>{stage.label}</span>
+                        {stage.detail && <span>{stage.detail}</span>}
+                      </div>
+                      <div className="h-2 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-gray-600">
+                        {stage.fraction === null ? (
+                          <div className="h-full w-1/3 animate-pulse rounded-full bg-green-500" />
+                        ) : (
+                          <div
+                            className="h-full rounded-full bg-green-500 transition-all"
+                            style={{ width: `${Math.round(stage.fraction * 100)}%` }}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
                   <Button
                     onClick={handleUpload}
-                    disabled={loading}
+                    disabled={loading || !serverReady}
                     className="w-full bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
                   >
-                    {loading ? "Processing..." : "Process Video"}
+                    {loading ? (stage ? stage.label : "Processing...") : "Process Video"}
                   </Button>
                 </div>
               </CardContent>

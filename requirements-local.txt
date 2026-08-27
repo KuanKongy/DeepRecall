@@ -1,0 +1,4 @@
+# Optional CPU transcription backend (the "local" mode). Not installed in the
+# Railway image: ctranslate2 + onnxruntime add hundreds of MB and a shared
+# vCPU transcribes far slower and dearer than Groq.
+faster-whisper

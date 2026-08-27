@@ -5,5 +5,4 @@ ffmpeg-python
 redis
 tiktoken
 numpy
-faster-whisper
 gunicorn

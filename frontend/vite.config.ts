@@ -16,5 +16,9 @@ export default defineConfig(({ mode }) => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  // ffmpeg.wasm breaks under Vite's dependency pre-bundling.
+  optimizeDeps: {
+    exclude: ["@ffmpeg/ffmpeg", "@ffmpeg/util"],
+  },
   base: '/DeepRecall/',
 }));
