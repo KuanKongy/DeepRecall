@@ -1,0 +1,4 @@
+# Apple Silicon only — local GPU transcription via MLX.
+# Install alongside the base requirements:
+#   pip install -r requirements.txt -r requirements-mac.txt
+mlx-whisper

@@ -1,37 +1,27 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import whisper
 import openai
 import os
-import re
+import glob
 import ffmpeg
-import torch
 import redis
 import hashlib
 import tiktoken
 import json
+import tempfile
 import numpy as np
-from flask_caching import Cache
-from sentence_transformers import SentenceTransformer, util
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 
 app = Flask(__name__)
 CORS(app)
 
 
-# Redis Cache Configuration
-# app.config['CACHE_TYPE'] = 'redis'
-# app.config['CACHE_REDIS_HOST'] = 'localhost'
-# app.config['CACHE_REDIS_PORT'] = 6379
-# app.config['CACHE_REDIS_DB'] = 0
-# app.config['CACHE_REDIS_URL'] = 'redis://localhost:6379/0'
-# cache = Cache(app)
-#redis_client = redis.Redis(host='localhost', port=6379, db=0)
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_client = redis.from_url(redis_url)
-app.config['CACHE_TYPE'] = 'redis'
-app.config['CACHE_REDIS_URL'] = redis_url
-cache = Cache(app)
+
+CACHE_TTL = 86400
 
 
 # Load OpenAI API key
@@ -39,20 +29,29 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
     raise ValueError("Missing OpenAI API key! Set OPENAI_API_KEY in your environment.")
 
+openai_client = openai.OpenAI(api_key=openai.api_key)
 
-# Load Whisper model
-try:
-    model = whisper.load_model("base")
-    print(f"Whisper device: {model.device}")
-    print("Whisper model loaded successfully.")
-except Exception as e:
-    print(f"Error loading Whisper model: {e}")
-    exit(1)
+SUMMARY_MODEL = "gpt-4o-mini"
+EMBEDDING_MODEL = "text-embedding-3-small"
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+GROQ_CHUNK_SECONDS = 600  # 10-minute chunks transcribed in parallel
+GROQ_MAX_WORKERS = 6      # stays under Groq free-tier rate limits
+
+# Transcription backend: "groq" (API, fastest), "mlx" (Apple Silicon GPU),
+# "local" (faster-whisper on CPU). Overridable per request via the "backend"
+# form field on /process_video.
+DEFAULT_BACKEND = os.getenv("TRANSCRIBE_BACKEND", "groq").lower()
+VALID_BACKENDS = ("groq", "mlx", "local")
 
 
-# Load Sentence Transformer for search
-device = "cuda" if torch.cuda.is_available() else "cpu"
-search_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+def get_groq_client():
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not set. Add it to your environment, "
+            "or use the 'local'/'mlx' backend instead."
+        )
+    return openai.OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
 
 
 def get_video_hash(video_path):
@@ -64,137 +63,220 @@ def get_video_hash(video_path):
     return hasher.hexdigest()
 
 
-def transcribe_audio_with_timestamps(video_path):
-    """Extracts audio from video and transcribes it using Whisper with timestamps."""
-    audio_path = "temp_audio.wav"
+def extract_audio(video_path, workdir):
+    """Extract 16kHz mono 32kbps MP3 — all Whisper variants only use 16kHz mono,
+    and an hour of audio stays under Groq's 25MB upload limit."""
+    audio_path = os.path.join(workdir, "audio.mp3")
+    (
+        ffmpeg.input(video_path)
+        .output(audio_path, vn=None, ac=1, ar=16000, audio_bitrate="32k")
+        .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+    )
+    return audio_path
+
+
+def split_audio(audio_path, workdir, segment_seconds=GROQ_CHUNK_SECONDS):
+    """Split audio into fixed-length chunks (stream copy, no re-encode)."""
+    pattern = os.path.join(workdir, "chunk_%03d.mp3")
+    (
+        ffmpeg.input(audio_path)
+        .output(pattern, f="segment", segment_time=segment_seconds, c="copy")
+        .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+    )
+    return sorted(glob.glob(os.path.join(workdir, "chunk_*.mp3")))
+
+
+def _segments_to_transcript(segments, offset=0.0):
+    return [
+        {"start": seg["start"] + offset, "end": seg["end"] + offset, "text": seg["text"]}
+        for seg in segments
+    ]
+
+
+def _transcribe_groq(audio_path, workdir):
+    """Chunk the audio and transcribe all chunks in parallel on Groq."""
+    client = get_groq_client()
+    chunk_paths = split_audio(audio_path, workdir)
+
+    def transcribe_chunk(index_and_path):
+        index, path = index_and_path
+        with open(path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model=GROQ_WHISPER_MODEL,
+                file=f,
+                response_format="verbose_json",
+            )
+        offset = index * GROQ_CHUNK_SECONDS
+        if result.segments:
+            segments = [
+                {"start": seg.start, "end": seg.end, "text": seg.text}
+                for seg in result.segments
+            ]
+        else:
+            segments = [{"start": 0.0, "end": float(GROQ_CHUNK_SECONDS), "text": result.text}]
+        return _segments_to_transcript(segments, offset)
+
+    with ThreadPoolExecutor(max_workers=GROQ_MAX_WORKERS) as pool:
+        chunk_transcripts = list(pool.map(transcribe_chunk, enumerate(chunk_paths)))
+
+    return [seg for chunk in chunk_transcripts for seg in chunk]
+
+
+def _transcribe_mlx(audio_path):
+    """Local transcription on Apple Silicon's GPU via MLX (pip install mlx-whisper)."""
     try:
-        ffmpeg.input(video_path).output(audio_path, format='wav').run(overwrite_output=True)
-        result = model.transcribe(audio_path, word_timestamps=True)
-        segments = result['segments']
-        transcript = [{"start": seg['start'], "end": seg['end'], "text": seg['text']} for seg in segments]
-        return transcript
-    except Exception as e:
-        print(f"Error in transcription: {e}")
-        return []
+        import mlx_whisper
+    except ImportError:
+        raise RuntimeError(
+            "mlx-whisper is not installed. Run: pip install -r requirements-mac.txt "
+            "(Apple Silicon only), or use the 'groq' or 'local' backend."
+        )
+    result = mlx_whisper.transcribe(
+        audio_path, path_or_hf_repo="mlx-community/whisper-large-v3-turbo"
+    )
+    return _segments_to_transcript(result["segments"])
 
 
-def split_text_by_sentences(text, max_tokens=5000):
-    """Splits text into chunks of ~5000 tokens, breaking at sentence boundaries."""
-    enc = tiktoken.encoding_for_model("gpt-4")
-    sentences = text.split(". ")  # Split by sentence
+_faster_whisper_model = None
+
+
+def _transcribe_local(audio_path):
+    """Portable CPU transcription via faster-whisper (CTranslate2, int8)."""
+    global _faster_whisper_model
+    from faster_whisper import WhisperModel
+
+    if _faster_whisper_model is None:
+        _faster_whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    segments, _info = _faster_whisper_model.transcribe(audio_path)
+    return [{"start": seg.start, "end": seg.end, "text": seg.text} for seg in segments]
+
+
+def transcribe_audio_with_timestamps(video_path, backend, workdir):
+    """Extracts audio from video and transcribes it with the selected backend."""
+    audio_path = extract_audio(video_path, workdir)
+    if backend == "groq":
+        return _transcribe_groq(audio_path, workdir)
+    if backend == "mlx":
+        return _transcribe_mlx(audio_path)
+    return _transcribe_local(audio_path)
+
+
+def split_text_by_sentences(text, max_tokens=50000):
+    """Splits text into token-bounded chunks, breaking at sentence boundaries."""
+    enc = tiktoken.get_encoding("cl100k_base")
+    sentences = text.split(". ")
     chunks = []
     current_chunk = []
     current_tokens = 0
 
     for sentence in sentences:
-        sentence_tokens = len(enc.encode(sentence))  # Count tokens in sentence
+        sentence_tokens = len(enc.encode(sentence))
         if current_tokens + sentence_tokens > max_tokens:
-            chunks.append(" ".join(current_chunk))  # Store current chunk
+            chunks.append(" ".join(current_chunk))
             current_chunk = []
             current_tokens = 0
         current_chunk.append(sentence)
         current_tokens += sentence_tokens
 
     if current_chunk:
-        chunks.append(" ".join(current_chunk))  # Add last chunk
+        chunks.append(" ".join(current_chunk))
 
     return chunks
 
 
+def _chat(system_prompt, text):
+    response = openai_client.chat.completions.create(
+        model=SUMMARY_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
 def summarize_text(text):
-    """Generates both a short and detailed summary from text chunks."""
-    client = openai.OpenAI(api_key=openai.api_key)
+    """Generates a short and a detailed summary, running API calls in parallel."""
+    enc = tiktoken.get_encoding("cl100k_base")
 
-    # Step 1: Split into chunks (~5000 tokens each, at sentence boundaries)
-    chunks = split_text_by_sentences(text, max_tokens=5000)
-    chunk_summaries = []
-
-    for chunk in chunks:
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "Summarize the following lecture transcript while preserving key details."},
-                    {"role": "user", "content": chunk}
-                ]
+    # gpt-4o-mini fits ~128k tokens, so a normal lecture goes through in one pass;
+    # only map-reduce transcripts that genuinely exceed the context window.
+    if len(enc.encode(text)) > 100000:
+        chunks = split_text_by_sentences(text, max_tokens=50000)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            chunk_summaries = list(
+                pool.map(
+                    lambda chunk: _chat(
+                        "Summarize the following lecture transcript while preserving key details.",
+                        chunk,
+                    ),
+                    chunks,
+                )
             )
-            summary = response.choices[0].message.content.strip()
-            chunk_summaries.append(summary)
+        source = " ".join(chunk_summaries)
+    else:
+        source = text
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        detailed_future = pool.submit(
+            _chat,
+            "Create a structured, detailed summary of the following lecture transcript. "
+            "Ensure it includes all key points, organized in sections. Use bullet points where necessary.",
+            source,
+        )
+        short_future = pool.submit(
+            _chat,
+            "Provide a very brief high-level summary of the following lecture in under 300 words.",
+            source,
+        )
+        try:
+            detailed_summary = detailed_future.result()
         except Exception as e:
-            print(f"Error summarizing chunk: {e}")
-            chunk_summaries.append("")
-
-    combined_text = " ".join(chunk_summaries)
-
-    # Step 2: Generate structured detailed summary
-    try:
-        detailed_response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": 
-                 "Create a structured, detailed summary of the following lecture transcript. "
-                 "Ensure it includes all key points, organized in sections. Use bullet points where necessary."},
-                {"role": "user", "content": combined_text}
-            ]
-        )
-        detailed_summary = detailed_response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Error generating detailed summary: {e}")
-        detailed_summary = "Detailed summary unavailable."
-
-    # Step 3: Generate short summary
-    try:
-        short_response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": 
-                 "Provide a very brief high-level summary of the following lecture in under 300 words."},
-                {"role": "user", "content": combined_text}
-            ]
-        )
-        short_summary = short_response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Error generating short summary: {e}")
-        short_summary = "Short summary unavailable."
+            print(f"Error generating detailed summary: {e}")
+            detailed_summary = "Detailed summary unavailable."
+        try:
+            short_summary = short_future.result()
+        except Exception as e:
+            print(f"Error generating short summary: {e}")
+            short_summary = "Short summary unavailable."
 
     return short_summary, detailed_summary
 
 
-def create_search_index(transcript):
-    """Creates an embedding index for search queries."""
-    sentences = [seg['text'] for seg in transcript]
-
+def create_search_index(transcript, cache_key):
+    """Embeds transcript sentences via the OpenAI API and caches them in Redis."""
+    sentences = [seg["text"] for seg in transcript if seg["text"].strip()]
     if not sentences:
         print("⚠️ No sentences found for embedding generation.")
-        return [], None
+        return False
 
-    try:
-        embeddings = search_model.encode(sentences, convert_to_tensor=True)
-        print(f"✅ Generated {len(embeddings)} embeddings.")
-        return sentences, embeddings
-    except Exception as e:
-        print(f"❌ Error generating embeddings: {e}")
-        return sentences, None
+    embeddings = []
+    for i in range(0, len(sentences), 2048):
+        response = openai_client.embeddings.create(
+            model=EMBEDDING_MODEL, input=sentences[i:i + 2048]
+        )
+        embeddings.extend(item.embedding for item in response.data)
+
+    vectors = np.array(embeddings, dtype=np.float32)
+    redis_client.setex(
+        f"search:{cache_key}",
+        CACHE_TTL,
+        json.dumps({"sentences": sentences, "dim": vectors.shape[1]}),
+    )
+    redis_client.setex(f"searchvec:{cache_key}", CACHE_TTL, vectors.tobytes())
+    print(f"✅ Generated {len(sentences)} embeddings.")
+    return True
 
 
-def search_query(query, sentences, embeddings):
-    """Finds relevant segments in transcript based on search query."""
-    try:
-        if embeddings.shape[0] == 0:
-            return "No matching results found."
+def search_query(query, sentences, vectors):
+    """Finds the most relevant transcript sentence for a query via cosine similarity."""
+    response = openai_client.embeddings.create(model=EMBEDDING_MODEL, input=[query])
+    query_vector = np.array(response.data[0].embedding, dtype=np.float32)
 
-        query_embedding = search_model.encode(query, convert_to_tensor=True)
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        embeddings = embeddings.to(device)
-        query_embedding = query_embedding.to(device)
-
-        scores = util.pytorch_cos_sim(query_embedding, embeddings)[0]
-        top_match = sentences[scores.argmax().item()]
-        return top_match
-    except Exception as e:
-        print(f"Error in search: {e}")
-        return "Search encountered an error."
+    scores = vectors @ query_vector / (
+        np.linalg.norm(vectors, axis=1) * np.linalg.norm(query_vector) + 1e-8
+    )
+    return sentences[int(np.argmax(scores))]
 
 
 def extract_highlights(transcript, keywords):
@@ -205,82 +287,81 @@ def extract_highlights(transcript, keywords):
 @app.route('/process_video', methods=['POST'])
 def process_video():
     """Handles video file upload, transcription with timestamps, and summarization."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded."}), 400
+
+    backend = (request.form.get("backend") or DEFAULT_BACKEND).lower()
+    if backend not in VALID_BACKENDS:
+        return jsonify({"error": f"Unknown backend '{backend}'. Valid: {', '.join(VALID_BACKENDS)}"}), 400
+
     try:
-        file = request.files['file']
-        video_path = "uploaded_video.mp4"
-        file.save(video_path)
-        print("✅ Video uploaded successfully.")
+        with tempfile.TemporaryDirectory() as workdir:
+            video_path = os.path.join(workdir, "upload.mp4")
+            request.files['file'].save(video_path)
+            print(f"✅ Video uploaded successfully. Backend: {backend}")
 
-        # Generate a unique hash for the video
-        video_hash = get_video_hash(video_path)
-        
-        # Check if transcription is cached
-        cached_transcript = redis_client.get(f"transcript:{video_hash}")
-        
-        if cached_transcript:
-            print("✅ Using cached transcription from Redis.")
-            transcript = eval(cached_transcript.decode('utf-8'))
-        else:
-            transcript = transcribe_audio_with_timestamps(video_path)
-            if not transcript:
-                return jsonify({"error": "Failed to transcribe video."}), 500
-            redis_client.setex(f"transcript:{video_hash}", 86400, str(transcript))
+            # Cache keys include the backend so a local transcript never masks an API one
+            video_key = f"{get_video_hash(video_path)}:{backend}"
 
-        text_content = " ".join([seg['text'] for seg in transcript])
-        
-        # Check if summary is cached
-        cached_summary = redis_client.get(f"summary:{video_hash}")
-        
+            cached_transcript = redis_client.get(f"transcript:{video_key}")
+            if cached_transcript:
+                print("✅ Using cached transcription from Redis.")
+                transcript = json.loads(cached_transcript)
+            else:
+                transcript = transcribe_audio_with_timestamps(video_path, backend, workdir)
+                if not transcript:
+                    return jsonify({"error": "Failed to transcribe video."}), 500
+                redis_client.setex(f"transcript:{video_key}", CACHE_TTL, json.dumps(transcript))
+
+        text_content = " ".join(seg['text'] for seg in transcript)
+
+        cached_summary = redis_client.get(f"summary:{video_key}")
         if cached_summary:
             print("✅ Using cached summary from Redis.")
-            summary = eval(cached_summary.decode('utf-8'))
+            summary = json.loads(cached_summary)
         else:
             short_summary, detailed_summary = summarize_text(text_content)
             summary = {"short": short_summary, "detailed": detailed_summary}
-            redis_client.setex(f"summary:{video_hash}", 86400, str(summary))
+            redis_client.setex(f"summary:{video_key}", CACHE_TTL, json.dumps(summary))
 
-        sentences, embeddings = create_search_index(transcript)
-
-        if embeddings is None:
-            print("❌ Failed to generate embeddings.")
-            return jsonify({"error": "Failed to generate embeddings."}), 500
+        if not redis_client.exists(f"searchvec:{video_key}"):
+            if not create_search_index(transcript, video_key):
+                return jsonify({"error": "Failed to generate embeddings."}), 500
 
         return jsonify({
             "transcript": transcript,
             "summary": summary,
-            "search_index": sentences,
-            "embeddings": embeddings.tolist()
+            "video_hash": video_key,
         })
     except Exception as e:
         print(f"❌ Error processing video: {e}")
-        return jsonify({"error": "Failed to process video."}), 500
+        return jsonify({"error": f"Failed to process video: {e}"}), 500
 
 
 @app.route('/search', methods=['POST'])
 def search():
-    """Handles search queries on transcript."""
+    """Handles search queries against the server-side embedding cache."""
     try:
         data = request.json
-        print(f"📨 Incoming search request: {data}")
+        print(f"📨 Incoming search request: {data.get('query')}")
 
         query = data.get("query", "")
-        sentences = data.get("search_index", [])
-        embeddings = data.get("embeddings", [])
+        video_key = data.get("video_hash", "")
 
         if not query:
             return jsonify({"error": "Query is required"}), 400
+        if not video_key:
+            return jsonify({"error": "video_hash is required. Process a video first."}), 400
 
-        if not sentences:
-            return jsonify({"error": "No transcript sentences found."}), 400
+        meta = redis_client.get(f"search:{video_key}")
+        vector_bytes = redis_client.get(f"searchvec:{video_key}")
+        if not meta or not vector_bytes:
+            return jsonify({"error": "Search index expired. Please re-process the video."}), 404
 
-        if not embeddings:
-            print("❌ No embeddings found. Returning error.")
-            return jsonify({"error": "Embeddings missing from request."}), 400
+        meta = json.loads(meta)
+        vectors = np.frombuffer(vector_bytes, dtype=np.float32).reshape(-1, meta["dim"])
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        embeddings = torch.tensor(embeddings).to(device)
-
-        result = search_query(query, sentences, embeddings)
+        result = search_query(query, meta["sentences"], vectors)
         return jsonify({"result": result})
     except Exception as e:
         print(f"❌ Error handling search: {e}")
@@ -307,21 +388,19 @@ def common():
     try:
         data = request.json
         transcript = data.get("transcript", [])
-        keywords = data.get("keywords", [])
-        split = transcript.split()
-        Counter = Counter(split)
-        common = Counter.most_common(5)
-        return jsonify({"Common keywords": common})
+        words = " ".join(seg['text'] for seg in transcript).lower().split()
+        common_words = Counter(words).most_common(5)
+        return jsonify({"Common keywords": common_words})
     except Exception as e:
         print(f"Error extracting commons: {e}")
         return jsonify({"error": "Failed to extract commons."}), 500
 
+
 @app.route("/")
 def hello_world():
-    print(torch.cuda.is_available())
-    print(f"Whisper device: {model.device}")
-    return "<h1>Hello, Docker boiii2 !!! </h1>"
+    return f"<h1>DeepRecall API — transcription backend: {DEFAULT_BACKEND}</h1>"
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    app.run(debug=True, host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port)

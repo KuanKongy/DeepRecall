@@ -1,11 +1,9 @@
 flask
 flask-cors
 openai
-openai-whisper
-torch
 ffmpeg-python
 redis
 tiktoken
-Flask-Caching
-sentence-transformers
 numpy
+faster-whisper
+gunicorn

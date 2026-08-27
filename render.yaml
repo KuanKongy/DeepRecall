@@ -3,11 +3,11 @@ services:
     name: whisper-transcriber
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn -b 0.0.0.0:$PORT --threads 8 --timeout 600 app:app
     envVars:
       - key: OPENAI_API_KEY
-      - key: CACHE_TYPE
-        value: redis
-      - key: CACHE_REDIS_URL
+      - key: GROQ_API_KEY
+      - key: TRANSCRIBE_BACKEND
+        value: groq
       - key: REDIS_URL
     plan: free

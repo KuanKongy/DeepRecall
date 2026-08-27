@@ -20,7 +20,8 @@ const Index = () => {
   const [video, setVideo] = useState<File | null>(null);
   const [summary, setSummary] = useState<any>("");
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
-  const [embeddings, setEmbeddings] = useState<number[][]>([]);
+  const [videoHash, setVideoHash] = useState<string>("");
+  const [backend, setBackend] = useState<"groq" | "mlx" | "local">("groq");
   const [query, setQuery] = useState<string>("");
   const [searchResult, setSearchResult] = useState<string>("");
   const [keywords, setKeywords] = useState<string>("");
@@ -61,14 +62,15 @@ const Index = () => {
     setLoading(true);
     const formData = new FormData();
     formData.append("file", video);
-    
+    formData.append("backend", backend);
+
     try {
       console.log("Uploading video...");
       const response = await axios.post(SERVER_URL+"/process_video", formData);
       console.log(response.data);
       setSummary(response.data.summary);
       setTranscript(response.data.transcript);
-      setEmbeddings(response.data.embeddings);
+      setVideoHash(response.data.video_hash);
       setLoading(false);
       toast({
         title: "Video processed successfully",
@@ -96,7 +98,7 @@ const Index = () => {
       return;
     }
     
-    if (transcript.length === 0 || embeddings.length === 0) {
+    if (transcript.length === 0 || !videoHash) {
       toast({
         title: "No data available",
         description: "Please upload and process a video first.",
@@ -104,14 +106,13 @@ const Index = () => {
       });
       return;
     }
-    
+
     setLoading(true);
     try {
       console.log("Requesting search...");
       const response = await axios.post(SERVER_URL+"/search", {
         query,
-        search_index: transcript.map((seg) => seg.text),
-        embeddings,
+        video_hash: videoHash,
       });
       console.log(response.data.result);
       setSearchResult(response.data.result);
@@ -228,8 +229,23 @@ const Index = () => {
                       </p>
                     )}
                   </div>
-                  <Button 
-                    onClick={handleUpload} 
+                  <div className="grid w-full max-w-sm items-center gap-1.5">
+                    <label htmlFor="backend-select" className="text-sm text-gray-700 dark:text-gray-300">
+                      Processing mode
+                    </label>
+                    <select
+                      id="backend-select"
+                      value={backend}
+                      onChange={(e) => setBackend(e.target.value as "groq" | "mlx" | "local")}
+                      className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm cursor-pointer"
+                    >
+                      <option value="groq">API — fast (Groq)</option>
+                      <option value="mlx">Local — MacBook GPU (MLX)</option>
+                      <option value="local">Local — CPU (faster-whisper)</option>
+                    </select>
+                  </div>
+                  <Button
+                    onClick={handleUpload}
                     disabled={loading}
                     className="w-full bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
                   >

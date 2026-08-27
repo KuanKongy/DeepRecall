@@ -5,7 +5,7 @@ services:
     build:
       context: .
     ports:
-      - 10000:10000
+      - 80:10000
     env_file:
       - .env
     develop:
