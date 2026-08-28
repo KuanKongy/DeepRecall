@@ -347,7 +347,9 @@ def _transcribe_file_api(client, model, path):
 def _transcribe_chunk_groq(client, path, chunk_duration):
     try:
         result = _with_retries(lambda: _transcribe_file_api(client, GROQ_WHISPER_MODEL, path))
-    except openai.RateLimitError:
+    except (openai.RateLimitError, openai.AuthenticationError):
+        # AuthenticationError included so a dummy GROQ_API_KEY still exercises
+        # the chunked path end-to-end through the fallback.
         if TRANSCRIBE_FALLBACK != "openai":
             raise
         result = _with_retries(lambda: _transcribe_file_api(openai_client, "whisper-1", path))
