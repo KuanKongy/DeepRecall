@@ -53,6 +53,13 @@ TRANSCRIBE_BACKEND=mlx python app.py
 The first run downloads ~1.6 GB of Whisper weights to `~/.cache/huggingface`.
 The hosted UI can also target a Mac backend: set the server URL to
 `http://localhost:10000` in the UI settings.
+The quickest Mac GPU setup is the helper script, which creates `.venv`,
+installs both requirements files, loads `.env`, and starts the backend in MLX
+mode with the in-memory cache:
+
+```sh
+./scripts/dev-mac.sh
+```
 
 ## Deploy
 
