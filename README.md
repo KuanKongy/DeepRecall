@@ -5,9 +5,9 @@ transcribes the audio, writes a short and a detailed summary, and builds a
 semantic search index over the transcript — cached by the video's SHA-256 so a
 video is only ever processed once.
 
-The server is a thin orchestrator: transcription runs on Groq
-(`whisper-large-v3-turbo`), or locally via MLX (Apple Silicon GPU) or
-faster-whisper (CPU); summaries and embeddings use the OpenAI API; the cache is
+The server is a thin orchestrator: transcription runs on OpenRouter
+(`whisper-large-v3`, routed across Groq/DeepInfra/Together), or locally via
+MLX (Apple Silicon GPU) or faster-whisper (CPU); summaries and embeddings use the OpenAI API; the cache is
 Redis (Upstash in production) with an in-process fallback for local dev.
 
 ## Architecture
@@ -23,8 +23,9 @@ Copy `.env.sample` to `.env` and fill in:
 | Variable | Meaning |
 |---|---|
 | `OPENAI_API_KEY` | Required — summaries and embeddings |
-| `GROQ_API_KEY` | Enables the `groq` transcription backend |
-| `TRANSCRIBE_BACKEND` | `groq` (default), `mlx`, or `local` |
+| `TRANSCRIBE_API_KEY` | OpenRouter key — enables the hosted `api` backend |
+| `TRANSCRIBE_BACKEND` | `api` (default), `mlx`, or `local` |
+| `TRANSCRIBE_BASE_URL` / `TRANSCRIBE_MODEL` | Optional: any OpenAI-compatible transcription endpoint |
 | `SUMMARY_MODEL` | Chat model for summaries (default `gpt-4.1-nano`) |
 | `REDIS_URL` | Optional; `rediss://…` from Upstash. Unset = memory cache |
 | `APP_PASSWORD` | Optional shared password (clients send `X-App-Password`) |
@@ -32,12 +33,12 @@ Copy `.env.sample` to `.env` and fill in:
 
 `GET /health` reports the active cache and which backends are available.
 
-## Run locally (Groq backend)
+## Run locally (hosted API backend)
 
 ```sh
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-TRANSCRIBE_BACKEND=groq python app.py        # http://127.0.0.1:10000
+TRANSCRIBE_BACKEND=api python app.py        # http://127.0.0.1:10000
 cd frontend && npm install && npm run dev    # http://localhost:8080
 ```
 

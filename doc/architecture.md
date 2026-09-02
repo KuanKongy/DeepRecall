@@ -60,7 +60,9 @@ Selected by `TRANSCRIBE_BACKEND` or a per-request `backend` field; discovered
 at boot with `importlib.util.find_spec` (no import — importing mlx_whisper
 would load the MLX runtime):
 
-- **groq** — Groq `whisper-large-v3-turbo` (~216× realtime). Audio is
+- **api** — any OpenAI-compatible hosted endpoint; by default OpenRouter's
+  `openai/whisper-large-v3`, which load-balances across Groq, DeepInfra and
+  Together (`TRANSCRIBE_BASE_URL` / `TRANSCRIBE_MODEL` override it). Audio is
   transcoded to 16 kHz mono 32 kbps MP3 (~14 MB/hour, under the 25 MB/file
   limit), split into 10-minute chunks (stream copy) and transcribed with 6
   workers in parallel. Chunks under ~1 s are dropped (the API rejects audio

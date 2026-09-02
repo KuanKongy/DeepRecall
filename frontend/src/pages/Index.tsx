@@ -61,7 +61,7 @@ const Index = () => {
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
   const [videoHash, setVideoHash] = useState<string>("");
   const [health, setHealth] = useState<HealthInfo | null>(null);
-  const [backend, setBackend] = useState<string>("groq");
+  const [backend, setBackend] = useState<string>("api");
   const [loading, setLoading] = useState<boolean>(false);
   const [stage, setStage] = useState<StageInfo | null>(null);
   const hashPromiseRef = useRef<Promise<string> | null>(null);

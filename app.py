@@ -94,11 +94,14 @@ openai_client = openai.OpenAI(api_key=openai.api_key)
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-4.1-nano")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "512"))
-GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+# Hosted transcription: any OpenAI-compatible endpoint. Defaults to OpenRouter,
+# which routes whisper-large-v3 across Groq, DeepInfra and Together.
+TRANSCRIBE_BASE_URL = os.getenv("TRANSCRIBE_BASE_URL", "https://openrouter.ai/api/v1")
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "openai/whisper-large-v3")
 MLX_WHISPER_MODEL = os.getenv("MLX_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
-GROQ_CHUNK_SECONDS = int(os.getenv("CHUNK_SECONDS", "600"))
-GROQ_MAX_WORKERS = 6      # stays under Groq free-tier rate limits
-# "openai" re-runs a chunk on whisper-1 when Groq stays rate-limited.
+CHUNK_SECONDS = int(os.getenv("CHUNK_SECONDS", "600"))
+TRANSCRIBE_MAX_WORKERS = 6  # parallel chunk uploads per job
+# "openai" re-runs a chunk on whisper-1 when the API stays rate-limited.
 TRANSCRIBE_FALLBACK = os.getenv("TRANSCRIBE_FALLBACK", "").lower()
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -108,8 +111,8 @@ def detect_backends():
     """Discover which transcription backends can run here. Uses find_spec, not
     a real import: importing mlx_whisper would load the MLX runtime at boot."""
     backends = []
-    if os.getenv("GROQ_API_KEY"):
-        backends.append("groq")
+    if os.getenv("TRANSCRIBE_API_KEY"):
+        backends.append("api")
     if (
         sys.platform == "darwin"
         and platform.machine() == "arm64"
@@ -123,7 +126,7 @@ def detect_backends():
 
 AVAILABLE_BACKENDS = detect_backends()
 
-_requested_backend = os.getenv("TRANSCRIBE_BACKEND", "groq").lower()
+_requested_backend = os.getenv("TRANSCRIBE_BACKEND", "api").lower()
 DEFAULT_BACKEND = (
     _requested_backend
     if _requested_backend in AVAILABLE_BACKENDS
@@ -148,7 +151,7 @@ def require_password():
 # set live in memory, job records live in the cache so the frontend can poll.
 # ---------------------------------------------------------------------------
 
-JOB_WORKERS = int(os.getenv("JOB_WORKERS", "2"))  # 2 jobs = 12 parallel Groq calls
+JOB_WORKERS = int(os.getenv("JOB_WORKERS", "2"))  # 2 jobs = 12 parallel API calls
 JOB_POOL = ThreadPoolExecutor(max_workers=JOB_WORKERS)
 _running_jobs = set()
 _jobs_lock = threading.Lock()
@@ -266,14 +269,14 @@ def _sweep_stale_workdirs():
 _sweep_stale_workdirs()
 
 
-def get_groq_client():
-    key = os.getenv("GROQ_API_KEY")
+def get_api_client():
+    key = os.getenv("TRANSCRIBE_API_KEY")
     if not key:
         raise RuntimeError(
-            "GROQ_API_KEY is not set. Add it to your environment, "
-            "or use the 'local'/'mlx' backend instead."
+            "TRANSCRIBE_API_KEY is not set (an OpenRouter key by default). "
+            "Add it to your environment, or use the 'mlx'/'local' backend instead."
         )
-    return openai.OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
+    return openai.OpenAI(api_key=key, base_url=TRANSCRIBE_BASE_URL)
 
 
 def get_video_hash(video_path):
@@ -288,7 +291,7 @@ def get_video_hash(video_path):
 def extract_audio(media_path, workdir):
     """Transcode any ffmpeg input (mp4, m4a from the browser demux, …) to
     16kHz mono 32kbps MP3 — all Whisper variants only use 16kHz mono, and an
-    hour of audio stays under Groq's 25MB upload limit."""
+    hour of audio stays under the hosted APIs' 25MB upload limit."""
     audio_path = os.path.join(workdir, "audio.mp3")
     (
         ffmpeg.input(media_path)
@@ -298,7 +301,7 @@ def extract_audio(media_path, workdir):
     return audio_path
 
 
-def split_audio(audio_path, workdir, segment_seconds=GROQ_CHUNK_SECONDS):
+def split_audio(audio_path, workdir, segment_seconds=CHUNK_SECONDS):
     """Split audio into fixed-length chunks (stream copy, no re-encode)."""
     pattern = os.path.join(workdir, "chunk_%03d.mp3")
     (
@@ -344,12 +347,12 @@ def _transcribe_file_api(client, model, path):
         )
 
 
-def _transcribe_chunk_groq(client, path, chunk_duration):
+def _transcribe_chunk_api(client, path, chunk_duration):
     try:
-        result = _with_retries(lambda: _transcribe_file_api(client, GROQ_WHISPER_MODEL, path))
+        result = _with_retries(lambda: _transcribe_file_api(client, TRANSCRIBE_MODEL, path))
     except (openai.RateLimitError, openai.AuthenticationError):
-        # AuthenticationError included so a dummy GROQ_API_KEY still exercises
-        # the chunked path end-to-end through the fallback.
+        # AuthenticationError included so a dummy TRANSCRIBE_API_KEY still
+        # exercises the chunked path end-to-end through the fallback.
         if TRANSCRIBE_FALLBACK != "openai":
             raise
         result = _with_retries(lambda: _transcribe_file_api(openai_client, "whisper-1", path))
@@ -358,13 +361,13 @@ def _transcribe_chunk_groq(client, path, chunk_duration):
             {"start": seg.start, "end": seg.end, "text": seg.text}
             for seg in result.segments
         ]
-    end = chunk_duration if chunk_duration else float(GROQ_CHUNK_SECONDS)
+    end = chunk_duration if chunk_duration else float(CHUNK_SECONDS)
     return [{"start": 0.0, "end": end, "text": result.text}]
 
 
-def _transcribe_groq(audio_path, workdir, progress=None):
-    """Chunk the audio and transcribe all chunks in parallel on Groq."""
-    client = get_groq_client()
+def _transcribe_api(audio_path, workdir, progress=None):
+    """Chunk the audio and transcribe all chunks in parallel on the hosted API."""
+    client = get_api_client()
 
     chunks = []
     for path in split_audio(audio_path, workdir):
@@ -378,16 +381,16 @@ def _transcribe_groq(audio_path, workdir, progress=None):
 
     results = {}
     completed = 0
-    with ThreadPoolExecutor(max_workers=GROQ_MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=TRANSCRIBE_MAX_WORKERS) as pool:
         futures = {
-            pool.submit(_transcribe_chunk_groq, client, path, duration): index
+            pool.submit(_transcribe_chunk_api, client, path, duration): index
             for index, path, duration in chunks
         }
         # Keyed by chunk index so ordering survives as_completed.
         for future in as_completed(futures):
             index = futures[future]
             results[index] = _segments_to_transcript(
-                future.result(), index * GROQ_CHUNK_SECONDS
+                future.result(), index * CHUNK_SECONDS
             )
             completed += 1
             if progress:
@@ -403,7 +406,7 @@ def _transcribe_mlx(audio_path):
     except ImportError:
         raise RuntimeError(
             "mlx-whisper is not installed. Run: pip install -r requirements-mac.txt "
-            "(Apple Silicon only), or use the 'groq' or 'local' backend."
+            "(Apple Silicon only), or use the 'api' or 'local' backend."
         )
     result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=MLX_WHISPER_MODEL)
     return _segments_to_transcript(result["segments"])
@@ -429,8 +432,8 @@ def _transcribe_local(audio_path, progress=None):
 
 
 def transcribe_audio(audio_path, backend, workdir, progress=None):
-    if backend == "groq":
-        return _transcribe_groq(audio_path, workdir, progress)
+    if backend == "api":
+        return _transcribe_api(audio_path, workdir, progress)
     if backend == "mlx":
         return _transcribe_mlx(audio_path)  # MLX reports no incremental progress
     return _transcribe_local(audio_path, progress)

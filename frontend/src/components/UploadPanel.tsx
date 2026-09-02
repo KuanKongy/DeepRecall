@@ -5,7 +5,7 @@ import { FileVideo } from "lucide-react";
 import type { HealthInfo } from "@/lib/api";
 
 const BACKEND_LABELS: Record<string, string> = {
-  groq: "API — fast (Groq)",
+  api: "API — fast (OpenRouter)",
   mlx: "Local — MacBook GPU (MLX)",
   local: "Local — CPU (faster-whisper)",
 };
