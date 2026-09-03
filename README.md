@@ -1,9 +1,11 @@
 # DeepRecall
 
-DeepRecall turns lecture videos into searchable knowledge. Upload an MP4 and it
-transcribes the audio, writes a short and a detailed summary, and builds a
-semantic search index over the transcript — cached by the video's SHA-256 so a
-video is only ever processed once.
+DeepRecall turns lecture videos into searchable knowledge. Upload a video
+(MP4/MOV/WebM/MKV) or paste a YouTube, Google Drive, or direct file link and it
+transcribes the audio, writes a short and a detailed summary with clickable
+key moments, and builds a semantic search index over the transcript — cached
+by the video's SHA-256 so a video is only ever processed once. The UI is
+phone-friendly, syncs the transcript with playback, and exports .txt/.srt.
 
 The server is a thin orchestrator: transcription runs on OpenRouter
 (`whisper-large-v3`, routed across Groq/DeepInfra/Together), or locally via

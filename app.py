@@ -215,13 +215,31 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
     so re-submitting after a crash resumes from the last completed stage."""
     try:
         if source_url:
-            _update_job(job_id, status="running", stage="downloading", message="Downloading")
+            # A URL seen before whose results are all still cached needs no
+            # re-download: the stages below will hit their cache keys.
+            sha256 = None
+            urlsha_raw = cache.get(f"urlsha:{url_key}")
+            if urlsha_raw:
+                known_sha = urlsha_raw.decode() if isinstance(urlsha_raw, bytes) else str(urlsha_raw)
+                known_key = f"{known_sha}:{backend}"
+                if (
+                    cache.get(f"transcript:{known_key}")
+                    and cache.get(f"summary:{known_key}")
+                    and cache.exists(f"search:{known_key}")
+                    and cache.exists(f"searchvec:{known_key}")
+                ):
+                    sha256 = known_sha
 
-            def dl_progress(current, total):
-                _update_job(job_id, progress={"current": current, "total": total})
+            if sha256 is None:
+                _update_job(job_id, status="running", stage="downloading", message="Downloading")
 
-            upload_path = _download_source(source_url, workdir, dl_progress)
-            sha256 = get_video_hash(upload_path)
+                def dl_progress(current, total):
+                    _update_job(job_id, progress={"current": current, "total": total})
+
+                upload_path = _download_source(source_url, workdir, dl_progress)
+                sha256 = get_video_hash(upload_path)
+                cache.setex(f"urlsha:{url_key}", CACHE_TTL, sha256)
+
             video_key = f"{sha256}:{backend}"
             # From here the job is addressable by file hash, like an upload.
             _update_job(job_id, sha256=sha256, video_hash=video_key, progress=None)

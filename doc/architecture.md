@@ -34,6 +34,23 @@ interceptor — the hosted page can target a backend on your own machine at
 `http://localhost:10000` (localhost is exempt from mixed-content blocking in
 Chrome/Firefox).
 
+## Processing from a URL
+
+`POST /process_url` accepts a YouTube, Google Drive, or direct file link and
+queues the same pipeline with an extra first stage, `downloading` (byte
+progress). URLs a yt-dlp extractor recognises (YouTube, Drive, and many other
+sites) are fetched audio-only via yt-dlp; anything else is stream-downloaded
+directly with a size cap and an SSRF guard (http(s) only, and the host must
+not resolve to a private address — redirects re-checked). The downloaded
+file's SHA-256 becomes the cache key, so a URL-processed video and the same
+file uploaded share one cache entry, and a `urlsha` mapping lets a re-submitted
+URL whose results are still cached skip the download entirely. YouTube jobs
+carry the video id so the UI can embed the official player (with seeking via
+the IFrame API); note YouTube may bot-block datacenter IPs, so that path is
+best-effort in production and reliable in local mode. The UI's "Try a demo"
+button feeds a sample lecture hosted as a GitHub Release asset through this
+same path.
+
 ## Server-side job pipeline
 
 `POST /process_video` validates the request, saves the upload to a
