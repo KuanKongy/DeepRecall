@@ -17,6 +17,10 @@ import redis
 import hashlib
 import tiktoken
 import json
+import socket
+import ipaddress
+import urllib.parse
+import urllib.request
 import tempfile
 import threading
 import numpy as np
@@ -206,10 +210,23 @@ def start_job(video_key, backend, upload_path, workdir):
     return job_id, False
 
 
-def run_pipeline(job_id, video_key, backend, upload_path, workdir):
+def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=None, url_key=None):
     """The whole pipeline off-request. Every stage checks its cache key first,
     so re-submitting after a crash resumes from the last completed stage."""
     try:
+        if source_url:
+            _update_job(job_id, status="running", stage="downloading", message="Downloading")
+
+            def dl_progress(current, total):
+                _update_job(job_id, progress={"current": current, "total": total})
+
+            upload_path = _download_source(source_url, workdir, dl_progress)
+            sha256 = get_video_hash(upload_path)
+            video_key = f"{sha256}:{backend}"
+            # From here the job is addressable by file hash, like an upload.
+            _update_job(job_id, sha256=sha256, video_hash=video_key, progress=None)
+            cache.setex(f"jobfor:{video_key}", JOB_TTL, job_id)
+
         _update_job(job_id, status="running", stage="extracting", message="Extracting audio")
 
         transcript_raw = cache.get(f"transcript:{video_key}")
@@ -250,9 +267,178 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir):
         _update_job(job_id, status="error", stage="error", error=str(e), message="Failed")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        cache.delete(f"jobfor:{video_key}")
+        if video_key:
+            cache.delete(f"jobfor:{video_key}")
+        if url_key:
+            cache.delete(f"jobfor:{url_key}")
         with _jobs_lock:
             _running_jobs.discard(job_id)
+
+
+def start_url_job(url, backend, workdir):
+    """Queue a job that downloads its source from a URL. Dedupes on the URL
+    until the file hash is known, then on the hash like upload jobs."""
+    url_key = f"url:{hashlib.sha256(url.encode()).hexdigest()}:{backend}"
+    with _jobs_lock:
+        existing = cache.get(f"jobfor:{url_key}")
+        if existing:
+            existing_id = existing.decode() if isinstance(existing, bytes) else str(existing)
+            raw = cache.get(f"job:{existing_id}")
+            still_running = (
+                raw
+                and json.loads(raw).get("status") in ("queued", "running")
+                and existing_id in _running_jobs
+            )
+            if still_running:
+                shutil.rmtree(workdir, ignore_errors=True)
+                return existing_id, True
+
+        job_id = uuid.uuid4().hex[:16]
+        now = time.time()
+        record = {
+            "status": "queued",
+            "stage": "queued",
+            "progress": None,
+            "message": "Waiting for a worker",
+            "sha256": None,
+            "backend": backend,
+            "video_hash": None,
+            "source_url": url,
+            "youtube_id": _youtube_id(url),
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        cache.setex(f"job:{job_id}", JOB_TTL, json.dumps(record))
+        cache.setex(f"jobfor:{url_key}", JOB_TTL, job_id)
+        _running_jobs.add(job_id)
+
+    JOB_POOL.submit(run_pipeline, job_id, None, backend, None, workdir, url, url_key)
+    return job_id, False
+
+
+def _youtube_id(url):
+    """Video id for youtube.com/watch, /shorts, /embed, /live and youtu.be."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    for prefix in ("www.", "m.", "music."):
+        host = host.removeprefix(prefix)
+    if host == "youtu.be":
+        vid = parsed.path.lstrip("/").split("/")[0]
+    elif host == "youtube.com":
+        if parsed.path == "/watch":
+            vid = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+        elif parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
+            parts = parsed.path.split("/")
+            vid = parts[2] if len(parts) > 2 else ""
+        else:
+            vid = ""
+    else:
+        return None
+    return vid if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or "") else None
+
+
+def _ytdlp_extractor_name(url):
+    """Name of the non-generic yt-dlp extractor that handles this URL, if any
+    (YouTube, Google Drive, Vimeo, …). Imported lazily: yt-dlp takes ~1s."""
+    from yt_dlp.extractor import gen_extractor_classes
+
+    for ie in gen_extractor_classes():
+        if ie.IE_NAME != "generic" and ie.suitable(url):
+            return ie.IE_NAME
+    return None
+
+
+def _download_with_ytdlp(url, workdir, progress=None):
+    import yt_dlp
+
+    def hook(d):
+        if progress and d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total:
+                progress(d.get("downloaded_bytes", 0), int(total))
+
+    options = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": os.path.join(workdir, "source.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "progress_hooks": [hook],
+        "max_filesize": app.config["MAX_CONTENT_LENGTH"],
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+    files = sorted(glob.glob(os.path.join(workdir, "source.*")))
+    if not files:
+        raise RuntimeError("The downloader produced no file.")
+    return files[0]
+
+
+def _assert_public_host(url):
+    """SSRF guard for direct downloads: http(s) only, and the host must not
+    resolve to a private/loopback/link-local address. (Best-effort: a
+    password-gated app, not a multi-tenant proxy.)"""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise RuntimeError("Only http(s) URLs are supported.")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise RuntimeError("That hostname does not resolve.")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise RuntimeError("That URL points at a private address.")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_public_host(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_direct(url, workdir, progress=None):
+    """Stream a direct file URL to disk with a size cap."""
+    _assert_public_host(url)
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    request_ = urllib.request.Request(url, headers={"User-Agent": "DeepRecall/1.0"})
+    limit = app.config["MAX_CONTENT_LENGTH"]
+    with opener.open(request_, timeout=60) as resp:
+        if "text/html" in (resp.headers.get("Content-Type") or ""):
+            raise RuntimeError(
+                "That link returns a web page, not a video file — use a direct file link."
+            )
+        total = int(resp.headers.get("Content-Length") or 0)
+        if total and total > limit:
+            raise RuntimeError("That file exceeds the size limit.")
+        ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+        path = os.path.join(workdir, "source" + (ext if ext in _UPLOAD_EXTS else ".bin"))
+        done = 0
+        with open(path, "wb") as f:
+            while chunk := resp.read(1024 * 1024):
+                done += len(chunk)
+                if done > limit:
+                    raise RuntimeError("That file exceeds the size limit.")
+                f.write(chunk)
+                if progress and total:
+                    progress(done, total)
+    return path
+
+
+def _download_source(url, workdir, progress=None):
+    if _ytdlp_extractor_name(url):
+        try:
+            return _download_with_ytdlp(url, workdir, progress)
+        except Exception as e:
+            message = str(e)
+            if "Sign in" in message or "bot" in message.lower():
+                raise RuntimeError(
+                    "YouTube blocked the server's request — try a direct file "
+                    "link or upload the file instead."
+                )
+            raise RuntimeError(f"Could not download from that link: {message[:200]}")
+    return _download_direct(url, workdir, progress)
 
 
 def _sweep_stale_workdirs():
@@ -637,6 +823,32 @@ def process_video():
         shutil.rmtree(workdir, ignore_errors=True)
         print(f"❌ Error accepting upload: {e}")
         return jsonify({"error": f"Failed to accept upload: {e}"}), 500
+
+
+@app.route('/process_url', methods=['POST'])
+def process_url():
+    """Queues processing of a video fetched from a URL (YouTube, Google Drive,
+    or a direct file link). Always 202; the client polls /jobs/<id>."""
+    data = request.json or {}
+    url = (data.get("url") or "").strip()
+    if not url.lower().startswith(("http://", "https://")) or len(url) > 2000:
+        return jsonify({"error": "Provide an http(s) URL."}), 400
+
+    backend = (data.get("backend") or DEFAULT_BACKEND or "").lower()
+    if backend not in AVAILABLE_BACKENDS:
+        return jsonify({
+            "error": f"Backend '{backend}' is not available on this server. "
+                     f"Available: {', '.join(AVAILABLE_BACKENDS) or 'none'}"
+        }), 400
+
+    workdir = tempfile.mkdtemp(prefix="deeprecall-")
+    try:
+        job_id, deduplicated = start_url_job(url, backend, workdir)
+        return jsonify({"job_id": job_id, "deduplicated": deduplicated}), 202
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        print(f"❌ Error accepting URL: {e}")
+        return jsonify({"error": f"Failed to accept URL: {e}"}), 500
 
 
 @app.route('/jobs/<job_id>')

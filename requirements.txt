@@ -6,3 +6,4 @@ redis
 tiktoken
 numpy
 gunicorn
+yt-dlp
