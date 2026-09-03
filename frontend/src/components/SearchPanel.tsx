@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Search } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
-import { searchTranscript, type SearchHit } from "@/lib/api";
+import { isUnauthorizedError, searchTranscript, type SearchHit } from "@/lib/api";
 import { fmtTime } from "@/lib/fmtTime";
 
 interface SearchPanelProps {
@@ -33,11 +33,13 @@ const SearchPanel = ({ videoHash, enabled, onSeek }: SearchPanelProps) => {
       setHits(await searchTranscript(query, videoHash));
     } catch (error) {
       console.error("Search failed", error);
-      toast({
-        title: "Search failed",
-        description: "There was an error processing your search query.",
-        variant: "destructive",
-      });
+      if (!isUnauthorizedError(error)) {
+        toast({
+          title: "Search failed",
+          description: "There was an error processing your search query.",
+          variant: "destructive",
+        });
+      }
     } finally {
       setBusy(false);
     }

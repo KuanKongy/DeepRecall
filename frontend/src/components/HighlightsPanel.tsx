@@ -12,9 +12,30 @@ interface HighlightsPanelProps {
   onSeek: (seconds: number) => void;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Wrap keyword matches in <mark> so hits are visible at a glance.
+function markTerms(text: string, terms: string[]): React.ReactNode {
+  if (terms.length === 0) return text;
+  const re = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "ig");
+  const lowered = terms.map((term) => term.toLowerCase());
+  return text.split(re).map((part, i) =>
+    lowered.includes(part.toLowerCase()) ? (
+      <mark key={i} className="rounded-sm bg-yellow-200 px-0.5 dark:bg-yellow-700/70 dark:text-gray-100">
+        {part}
+      </mark>
+    ) : (
+      part
+    ),
+  );
+}
+
 const HighlightsPanel = ({ transcript, onSeek }: HighlightsPanelProps) => {
   const [keywords, setKeywords] = useState("");
   const [highlights, setHighlights] = useState<TranscriptSegment[]>([]);
+  const [activeTerms, setActiveTerms] = useState<string[]>([]);
   const { toast } = useToast();
   const enabled = transcript.length > 0;
 
@@ -32,6 +53,7 @@ const HighlightsPanel = ({ transcript, onSeek }: HighlightsPanelProps) => {
       });
       return;
     }
+    setActiveTerms(terms);
     setHighlights(
       transcript.filter((seg) =>
         terms.some((term) => seg.text.toLowerCase().includes(term)),
@@ -79,7 +101,9 @@ const HighlightsPanel = ({ transcript, onSeek }: HighlightsPanelProps) => {
                   <span className="text-sm font-medium text-purple-600 dark:text-purple-400 mr-2">
                     {fmtTime(highlight.start)} – {fmtTime(highlight.end)}
                   </span>
-                  <span className="text-gray-700 dark:text-gray-200">{highlight.text}</span>
+                  <span className="text-gray-700 dark:text-gray-200">
+                    {markTerms(highlight.text, activeTerms)}
+                  </span>
                 </button>
               ))}
             </div>

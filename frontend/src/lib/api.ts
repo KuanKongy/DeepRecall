@@ -36,7 +36,27 @@ export function saveSettings(settings: ApiSettings): void {
 // Base URL and password are read per request so the settings popover takes
 // effect immediately. This also lets the hosted UI target a Mac backend at
 // http://localhost:10000 (exempt from mixed-content blocking in Chrome/Firefox).
+export function isUnauthorizedError(err: unknown): boolean {
+  return axios.isAxiosError(err) && err.response?.status === 401;
+}
+
+// Registered by the app shell; called on any 401 so the user learns the
+// password in Settings is wrong or missing.
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(handler: () => void): void {
+  onUnauthorized = handler;
+}
+
 export const api = axios.create();
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (axios.isAxiosError(err) && err.response?.status === 401 && onUnauthorized) {
+      onUnauthorized();
+    }
+    return Promise.reject(err);
+  },
+);
 api.interceptors.request.use((config) => {
   const settings = loadSettings();
   config.baseURL = settings.apiUrl;
@@ -73,9 +93,11 @@ export interface JobRecord {
   stage: string;
   progress: JobProgress | null;
   message: string;
-  sha256: string;
+  sha256: string | null;
   backend: string;
-  video_hash: string;
+  video_hash: string | null;
+  source_url?: string | null;
+  youtube_id?: string | null;
   error: string | null;
 }
 
@@ -145,6 +167,11 @@ export async function submitMedia(
       if (e.total) onUploadProgress(e.loaded / e.total);
     },
   });
+  return res.data;
+}
+
+export async function processUrl(url: string, backend: string): Promise<SubmitResult> {
+  const res = await api.post<SubmitResult>("/process_url", { url, backend });
   return res.data;
 }
 

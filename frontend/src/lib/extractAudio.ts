@@ -24,26 +24,40 @@ function getFFmpeg(): Promise<FFmpeg> {
   return ffmpegPromise;
 }
 
+export interface ExtractedAudio {
+  blob: Blob;
+  filename: string;
+}
+
 // Demux the audio track without re-encoding (seconds, not minutes), so a
-// 1 GB lecture uploads as a ~40 MB m4a. WORKERFS mounts the File directly
-// instead of copying it into wasm memory.
-export async function extractAudio(file: File): Promise<Blob> {
+// 1 GB lecture uploads as a ~40 MB file. WORKERFS mounts the File directly
+// instead of copying it into wasm memory. AAC sources (mp4/mov) land in m4a;
+// opus/vorbis sources (webm/mkv) need the webm container instead.
+export async function extractAudio(file: File): Promise<ExtractedAudio> {
   const ffmpeg = await getFFmpeg();
   await ffmpeg.createDir("/input");
   await ffmpeg.mount(FFFSType.WORKERFS, { files: [file] }, "/input");
+  const attempts: Array<{ out: string; type: string }> = [
+    { out: "audio.m4a", type: "audio/mp4" },
+    { out: "audio.webm", type: "audio/webm" },
+  ];
   try {
-    const code = await ffmpeg.exec([
-      "-hide_banner", "-loglevel", "error",
-      "-i", `/input/${file.name}`,
-      "-vn", "-c:a", "copy", "-y", "audio.m4a",
-    ]);
-    if (code !== 0) {
-      throw new Error(`ffmpeg demux failed with exit code ${code}`);
+    for (const attempt of attempts) {
+      const code = await ffmpeg.exec([
+        "-hide_banner", "-loglevel", "error",
+        "-i", `/input/${file.name}`,
+        "-vn", "-c:a", "copy", "-y", attempt.out,
+      ]);
+      if (code !== 0) continue;
+      const data = await ffmpeg.readFile(attempt.out);
+      await ffmpeg.deleteFile(attempt.out);
+      return { blob: new Blob([data], { type: attempt.type }), filename: attempt.out };
     }
-    const data = await ffmpeg.readFile("audio.m4a");
-    return new Blob([data], { type: "audio/mp4" });
+    throw new Error("ffmpeg could not demux the audio track");
   } finally {
-    try { await ffmpeg.deleteFile("audio.m4a"); } catch { /* never created */ }
+    for (const attempt of attempts) {
+      try { await ffmpeg.deleteFile(attempt.out); } catch { /* not created */ }
+    }
     try {
       await ffmpeg.unmount("/input");
       await ffmpeg.deleteDir("/input");

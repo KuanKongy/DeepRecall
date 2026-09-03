@@ -56,7 +56,7 @@ const SettingsPopover = ({ onSaved }: SettingsPopoverProps) => {
         <Settings className="h-5 w-5" />
       </Button>
       {open && (
-        <div className="absolute right-0 z-50 mt-2 w-80 rounded-md border bg-white p-4 shadow-lg dark:border-gray-600 dark:bg-gray-800">
+        <div className="absolute right-0 z-50 mt-2 w-80 max-w-[calc(100vw-2rem)] rounded-md border bg-white p-4 shadow-lg dark:border-gray-600 dark:bg-gray-800">
           <div className="space-y-3">
             <div className="space-y-1">
               <label className="text-sm text-gray-700 dark:text-gray-300" htmlFor="api-url">
