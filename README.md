@@ -30,7 +30,7 @@ Copy `.env.sample` to `.env` and fill in:
 | `TRANSCRIBE_BASE_URL` / `TRANSCRIBE_MODEL` | Optional: any OpenAI-compatible transcription endpoint |
 | `SUMMARY_MODEL` | Chat model for summaries (default `gpt-4.1-nano`) |
 | `REDIS_URL` | Optional; `rediss://…` from Upstash. Unset = memory cache |
-| `RATE_LIMIT_JOBS_PER_HOUR` | Per-IP analyses per hour (default 10; 0 disables) |
+| `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY` | Per-IP analyses (defaults 10/hour, 20/day; 0 disables) |
 | `MAX_DURATION_SECONDS` | Longest accepted video (default 10800 = 3 h) |
 | `CORS_ORIGINS` | Comma-separated origin allowlist |
 

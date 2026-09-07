@@ -144,10 +144,7 @@ MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))  # 3 hour
 # ---------------------------------------------------------------------------
 
 RATE_LIMIT_JOBS_PER_HOUR = int(os.getenv("RATE_LIMIT_JOBS_PER_HOUR", "10"))  # 0 disables
-_RATE_LIMIT_MSG = (
-    f"Rate limit reached: {RATE_LIMIT_JOBS_PER_HOUR} video analyses per hour. "
-    "Try again later."
-)
+RATE_LIMIT_JOBS_PER_DAY = int(os.getenv("RATE_LIMIT_JOBS_PER_DAY", "20"))    # 0 disables
 _rate_buckets = {}
 _rate_lock = threading.Lock()
 
@@ -160,31 +157,64 @@ def _client_ip():
 
 
 def _claim_job_slot(ip):
-    """Take one analysis slot for this IP; False when the hourly cap is hit."""
-    if RATE_LIMIT_JOBS_PER_HOUR <= 0:
-        return True
+    """Take one analysis slot for this IP against both windows (burst 10/hour,
+    cap 20/day by default). Returns (True, 0, None) when granted, else
+    (False, seconds_until_a_slot_frees, "hour"|"day")."""
+    if RATE_LIMIT_JOBS_PER_HOUR <= 0 and RATE_LIMIT_JOBS_PER_DAY <= 0:
+        return True, 0, None
     now = time.time()
     with _rate_lock:
         bucket = _rate_buckets.setdefault(ip, deque())
-        while bucket and now - bucket[0] > 3600:
+        while bucket and now - bucket[0] > 86400:
             bucket.popleft()
         for stale in [key for key, entries in _rate_buckets.items() if not entries]:
             if stale != ip:
                 del _rate_buckets[stale]
-        if len(bucket) >= RATE_LIMIT_JOBS_PER_HOUR:
-            return False
+
+        retry_after, scope = 0, None
+        hour_hits = [t for t in bucket if now - t <= 3600]
+        if RATE_LIMIT_JOBS_PER_HOUR > 0 and len(hour_hits) >= RATE_LIMIT_JOBS_PER_HOUR:
+            retry_after = int(hour_hits[0] + 3600 - now) + 1
+            scope = "hour"
+        if RATE_LIMIT_JOBS_PER_DAY > 0 and len(bucket) >= RATE_LIMIT_JOBS_PER_DAY:
+            day_wait = int(bucket[0] + 86400 - now) + 1
+            if day_wait > retry_after:
+                retry_after, scope = day_wait, "day"
+        if scope:
+            return False, retry_after, scope
+
         bucket.append(now)
-        return True
+        return True, 0, None
 
 
 def _release_job_slot(ip):
     """Give back a slot when no new analysis actually started (dedupe/error)."""
-    if RATE_LIMIT_JOBS_PER_HOUR <= 0:
-        return
     with _rate_lock:
         bucket = _rate_buckets.get(ip)
         if bucket:
             bucket.pop()
+
+
+def _fmt_wait(seconds):
+    if seconds < 90:
+        return "a minute"
+    if seconds < 5400:
+        return f"{(seconds + 59) // 60} minutes"
+    hours = (seconds + 1799) // 3600
+    return f"about {hours} hour" + ("s" if hours > 1 else "")
+
+
+def _rate_limited_response(retry_after, scope):
+    limit = RATE_LIMIT_JOBS_PER_HOUR if scope == "hour" else RATE_LIMIT_JOBS_PER_DAY
+    per = "per hour" if scope == "hour" else "per day"
+    response = jsonify({
+        "error": f"Rate limit reached ({limit} analyses {per}). "
+                 f"Try again in {_fmt_wait(retry_after)}.",
+        "retry_after": retry_after,
+    })
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -867,8 +897,9 @@ def process_video():
         return jsonify({"error": "video_hash must be a 64-char hex SHA-256."}), 400
 
     ip = _client_ip()
-    if not _claim_job_slot(ip):
-        return jsonify({"error": _RATE_LIMIT_MSG}), 429
+    allowed, retry_after, scope = _claim_job_slot(ip)
+    if not allowed:
+        return _rate_limited_response(retry_after, scope)
 
     workdir = tempfile.mkdtemp(prefix="deeprecall-")
     try:
@@ -914,8 +945,9 @@ def process_url():
         }), 400
 
     ip = _client_ip()
-    if not _claim_job_slot(ip):
-        return jsonify({"error": _RATE_LIMIT_MSG}), 429
+    allowed, retry_after, scope = _claim_job_slot(ip)
+    if not allowed:
+        return _rate_limited_response(retry_after, scope)
 
     workdir = tempfile.mkdtemp(prefix="deeprecall-")
     try:
@@ -943,8 +975,9 @@ def resummarize():
         return jsonify({"error": "Transcript expired — re-process the video first."}), 404
 
     ip = _client_ip()
-    if not _claim_job_slot(ip):
-        return jsonify({"error": _RATE_LIMIT_MSG}), 429
+    allowed, retry_after, scope = _claim_job_slot(ip)
+    if not allowed:
+        return _rate_limited_response(retry_after, scope)
     try:
         transcript = json.loads(transcript_raw)
         short_summary, detailed_summary = summarize_text(transcript)

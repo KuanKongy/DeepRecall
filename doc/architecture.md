@@ -126,9 +126,12 @@ API one. `GET /health` reports the cache mode and a live Redis ping.
 
 The app is open — no accounts, no password. Spend is bounded instead:
 
-- A per-IP rate limit (default 10 analyses/hour, `RATE_LIMIT_JOBS_PER_HOUR`)
-  on the endpoints that cost model money: `/process_video`, `/process_url`
-  and `/resummarize`. Attaching to an already-running job for the same video
+- A per-IP rate limit — a burst window and a daily cap (defaults 10
+  analyses/hour and 20/day, `RATE_LIMIT_JOBS_PER_HOUR` /
+  `RATE_LIMIT_JOBS_PER_DAY`) — on the endpoints that cost model money:
+  `/process_video`, `/process_url` and `/resummarize`. A 429 carries
+  `retry_after` seconds and a Retry-After header, and the UI tells the user
+  how long to wait. Attaching to an already-running job for the same video
   doesn't consume a slot; searches and polling are unlimited. In-memory,
   which is correct under the single-worker deployment; the client IP comes
   from `X-Forwarded-For` behind the platform proxy.
