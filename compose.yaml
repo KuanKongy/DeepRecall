@@ -1,14 +1,33 @@
-include:
-   - redis-docker-compose.yaml
 services:
-  server:
+  api:
     build:
       context: .
     ports:
-      - 80:10000
+      - "10000:10000"
     env_file:
       - .env
-    develop:
-      watch:
-        - action: rebuild
-          path: .
+    environment:
+      # Overrides whatever .env says; inside the compose network the cache
+      # is always this Redis service.
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # What the user's browser calls — the api service published above.
+        VITE_API_URL: http://localhost:10000
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:

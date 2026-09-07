@@ -73,7 +73,12 @@ mode with the in-memory cache:
 - **Frontend**: `cd frontend && npm run deploy` publishes to GitHub Pages.
   `frontend/.env.production` holds the Railway domain.
 
-## Local Docker
+## Local Docker (everything in one command)
 
-`docker compose up --build` runs the API plus a local Redis
-(`compose.yaml` + `redis-docker-compose.yaml`).
+```sh
+docker compose up --build
+```
+
+Starts the whole stack: the UI at http://localhost:8080, the API at
+http://localhost:10000, and a Redis cache. Only `OPENAI_API_KEY` and
+`TRANSCRIBE_API_KEY` need to be set in `.env`.
