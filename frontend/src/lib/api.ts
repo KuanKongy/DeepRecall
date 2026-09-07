@@ -6,7 +6,6 @@ const SETTINGS_KEY = "deeprecall-settings";
 
 export interface ApiSettings {
   apiUrl: string;
-  password: string;
 }
 
 export function loadSettings(): ApiSettings {
@@ -14,15 +13,12 @@ export function loadSettings(): ApiSettings {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return {
-        apiUrl: parsed.apiUrl || DEFAULT_API,
-        password: parsed.password || "",
-      };
+      return { apiUrl: parsed.apiUrl || DEFAULT_API };
     }
   } catch {
     /* storage unavailable or corrupt — fall through to defaults */
   }
-  return { apiUrl: DEFAULT_API, password: "" };
+  return { apiUrl: DEFAULT_API };
 }
 
 export function saveSettings(settings: ApiSettings): void {
@@ -33,34 +29,22 @@ export function saveSettings(settings: ApiSettings): void {
   }
 }
 
-// Base URL and password are read per request so the settings popover takes
-// effect immediately. This also lets the hosted UI target a Mac backend at
+// The base URL is read per request so the settings popover takes effect
+// immediately. This also lets the hosted UI target a Mac backend at
 // http://localhost:10000 (exempt from mixed-content blocking in Chrome/Firefox).
-export function isUnauthorizedError(err: unknown): boolean {
-  return axios.isAxiosError(err) && err.response?.status === 401;
-}
-
-// Registered by the app shell; called on any 401 so the user learns the
-// password in Settings is wrong or missing.
-let onUnauthorized: (() => void) | null = null;
-export function setUnauthorizedHandler(handler: () => void): void {
-  onUnauthorized = handler;
+// Prefer the server's own error message (rate limits, validation) over
+// axios's generic "Request failed with status code N".
+export function errorMessage(err: unknown, fallback: string): string {
+  if (axios.isAxiosError(err)) {
+    const data = err.response?.data as { error?: string } | undefined;
+    if (data?.error) return data.error;
+  }
+  return err instanceof Error ? err.message : fallback;
 }
 
 export const api = axios.create();
-api.interceptors.response.use(
-  (res) => res,
-  (err) => {
-    if (axios.isAxiosError(err) && err.response?.status === 401 && onUnauthorized) {
-      onUnauthorized();
-    }
-    return Promise.reject(err);
-  },
-);
 api.interceptors.request.use((config) => {
-  const settings = loadSettings();
-  config.baseURL = settings.apiUrl;
-  if (settings.password) config.headers["X-App-Password"] = settings.password;
+  config.baseURL = loadSettings().apiUrl;
   return config;
 });
 
@@ -177,6 +161,11 @@ export async function processUrl(url: string, backend: string): Promise<SubmitRe
 
 export async function getJob(jobId: string): Promise<JobRecord> {
   return (await api.get<JobRecord>(`/jobs/${jobId}`)).data;
+}
+
+export async function resummarize(videoHash: string): Promise<Summary> {
+  const res = await api.post<{ summary: Summary }>("/resummarize", { video_hash: videoHash });
+  return res.data.summary;
 }
 
 export async function searchTranscript(

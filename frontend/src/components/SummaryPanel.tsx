@@ -2,13 +2,16 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Copy, PlayCircle } from "lucide-react";
+import { Copy, PlayCircle, RotateCw } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import type { Summary } from "@/lib/api";
 
 interface SummaryPanelProps {
   summary: Summary | null;
   onSeek: (seconds: number) => void;
+  onRegenerate: () => void;
+  regenerating: boolean;
 }
 
 const TS_RE = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
@@ -26,7 +29,7 @@ function parseSeek(href: string): number | null {
   return parts.reduce((total, part) => total * 60 + part, 0);
 }
 
-const SummaryPanel = ({ summary, onSeek }: SummaryPanelProps) => {
+const SummaryPanel = ({ summary, onSeek, onRegenerate, regenerating }: SummaryPanelProps) => {
   const [tab, setTab] = useState<"brief" | "detailed">("brief");
   const { toast } = useToast();
 
@@ -58,15 +61,31 @@ const SummaryPanel = ({ summary, onSeek }: SummaryPanelProps) => {
     <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90 flex flex-col">
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between gap-2">
-          <CardTitle className="text-xl flex items-center gap-2">
-            <PlayCircle className="h-5 w-5" /> Summary
-          </CardTitle>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <CardTitle className="text-xl flex items-center gap-2 cursor-help">
+                <PlayCircle className="h-5 w-5" /> Summary
+              </CardTitle>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              AI-written brief and detailed summaries; timestamps are clickable.
+            </TooltipContent>
+          </Tooltip>
           {summary && (
             <div className="flex items-center gap-1.5">
               {tabButton("brief", "Brief")}
               {tabButton("detailed", "Detailed")}
               <Button variant="outline" size="sm" onClick={copyActive} title="Copy summary">
                 <Copy className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onRegenerate}
+                disabled={regenerating}
+                title="Regenerate the summary"
+              >
+                <RotateCw className={`h-4 w-4 ${regenerating ? "animate-spin" : ""}`} />
               </Button>
             </div>
           )}

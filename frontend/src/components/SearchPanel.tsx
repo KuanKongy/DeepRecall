@@ -4,7 +4,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Search } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
-import { isUnauthorizedError, searchTranscript, type SearchHit } from "@/lib/api";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { searchTranscript, type SearchHit } from "@/lib/api";
 import { fmtTime } from "@/lib/fmtTime";
 
 interface SearchPanelProps {
@@ -33,13 +34,11 @@ const SearchPanel = ({ videoHash, enabled, onSeek }: SearchPanelProps) => {
       setHits(await searchTranscript(query, videoHash));
     } catch (error) {
       console.error("Search failed", error);
-      if (!isUnauthorizedError(error)) {
-        toast({
-          title: "Search failed",
-          description: "There was an error processing your search query.",
-          variant: "destructive",
-        });
-      }
+      toast({
+        title: "Search failed",
+        description: "There was an error processing your search query.",
+        variant: "destructive",
+      });
     } finally {
       setBusy(false);
     }
@@ -48,9 +47,16 @@ const SearchPanel = ({ videoHash, enabled, onSeek }: SearchPanelProps) => {
   return (
     <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
       <CardHeader className="pb-2">
-        <CardTitle className="text-xl flex items-center gap-2">
-          <Search className="h-5 w-5" /> Transcript Search
-        </CardTitle>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <CardTitle className="text-xl flex items-center gap-2 cursor-help">
+              <Search className="h-5 w-5" /> Transcript Search
+            </CardTitle>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-xs">
+            Semantic search over the transcript — finds moments by meaning, not just exact words.
+          </TooltipContent>
+        </Tooltip>
       </CardHeader>
       <CardContent>
         <div className="space-y-4">

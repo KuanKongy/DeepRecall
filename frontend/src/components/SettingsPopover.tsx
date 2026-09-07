@@ -10,19 +10,16 @@ interface SettingsPopoverProps {
 }
 
 // Lets the hosted UI target a different backend — e.g. http://localhost:10000
-// for the Mac GPU mode — and stores the shared API password.
+// for the Mac GPU mode.
 const SettingsPopover = ({ onSaved }: SettingsPopoverProps) => {
   const [open, setOpen] = useState(false);
   const [apiUrl, setApiUrl] = useState("");
-  const [password, setPassword] = useState("");
   const panelRef = useRef<HTMLDivElement | null>(null);
   const { toast } = useToast();
 
   useEffect(() => {
     if (open) {
-      const settings = loadSettings();
-      setApiUrl(settings.apiUrl);
-      setPassword(settings.password);
+      setApiUrl(loadSettings().apiUrl);
     }
   }, [open]);
 
@@ -38,7 +35,7 @@ const SettingsPopover = ({ onSaved }: SettingsPopoverProps) => {
   }, [open]);
 
   const handleSave = () => {
-    saveSettings({ apiUrl: apiUrl.trim().replace(/\/+$/, "") || DEFAULT_API, password });
+    saveSettings({ apiUrl: apiUrl.trim().replace(/\/+$/, "") || DEFAULT_API });
     setOpen(false);
     toast({ title: "Settings saved", description: "API settings updated." });
     onSaved();
@@ -67,18 +64,6 @@ const SettingsPopover = ({ onSaved }: SettingsPopoverProps) => {
                 value={apiUrl}
                 onChange={(e) => setApiUrl(e.target.value)}
                 placeholder={DEFAULT_API}
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-sm text-gray-700 dark:text-gray-300" htmlFor="api-password">
-                Password
-              </label>
-              <Input
-                id="api-password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="X-App-Password"
               />
             </div>
             <div className="flex gap-2">

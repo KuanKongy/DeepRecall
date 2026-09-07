@@ -30,7 +30,8 @@ Copy `.env.sample` to `.env` and fill in:
 | `TRANSCRIBE_BASE_URL` / `TRANSCRIBE_MODEL` | Optional: any OpenAI-compatible transcription endpoint |
 | `SUMMARY_MODEL` | Chat model for summaries (default `gpt-4.1-nano`) |
 | `REDIS_URL` | Optional; `rediss://…` from Upstash. Unset = memory cache |
-| `APP_PASSWORD` | Optional shared password (clients send `X-App-Password`) |
+| `RATE_LIMIT_JOBS_PER_HOUR` | Per-IP analyses per hour (default 10; 0 disables) |
+| `MAX_DURATION_SECONDS` | Longest accepted video (default 10800 = 3 h) |
 | `CORS_ORIGINS` | Comma-separated origin allowlist |
 
 `GET /health` reports the active cache and which backends are available.

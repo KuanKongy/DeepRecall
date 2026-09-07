@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { CheckCircle2, FileVideo, Link as LinkIcon, RefreshCw } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { HealthInfo } from "@/lib/api";
 
 const BACKEND_LABELS: Record<string, string> = {
@@ -69,9 +70,16 @@ const UploadPanel = ({
   return (
     <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
       <CardHeader className="pb-2">
-        <CardTitle className="text-xl flex items-center gap-2">
-          <FileVideo className="h-5 w-5" /> Add a Video
-        </CardTitle>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <CardTitle className="text-xl flex items-center gap-2 cursor-help">
+              <FileVideo className="h-5 w-5" /> Add a Video
+            </CardTitle>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-xs">
+            Upload a video or paste a link; DeepRecall transcribes, summarizes, and indexes it for search.
+          </TooltipContent>
+        </Tooltip>
       </CardHeader>
       <CardContent>
         <div className="space-y-4">

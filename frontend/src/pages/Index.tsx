@@ -13,12 +13,12 @@ import SummaryPanel from "@/components/SummaryPanel";
 import SettingsPopover from "@/components/SettingsPopover";
 import YouTubePlayer, { type YouTubeHandle } from "@/components/YouTubePlayer";
 import {
+  errorMessage,
   getHealth,
   getJob,
-  isUnauthorizedError,
   lookupCache,
   processUrl,
-  setUnauthorizedHandler,
+  resummarize,
   submitMedia,
   type CacheHit,
   type HealthInfo,
@@ -85,11 +85,11 @@ const Index = () => {
   const [loading, setLoading] = useState<boolean>(false);
   const [stage, setStage] = useState<StageInfo | null>(null);
   const [precached, setPrecached] = useState<boolean>(false);
+  const [regenerating, setRegenerating] = useState<boolean>(false);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const hashPromiseRef = useRef<Promise<string> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const youtubeRef = useRef<YouTubeHandle | null>(null);
-  const lastAuthToastRef = useRef<number>(0);
   const { toast } = useToast();
   const { theme, setTheme } = useTheme();
 
@@ -105,21 +105,6 @@ const Index = () => {
   useEffect(() => {
     refreshHealth();
   }, [refreshHealth]);
-
-  useEffect(() => {
-    setUnauthorizedHandler(() => {
-      const now = Date.now();
-      if (now - lastAuthToastRef.current > 5000) {
-        lastAuthToastRef.current = now;
-        toast({
-          title: "Password required",
-          description: "The password is wrong or missing — set it in Settings ⚙.",
-          variant: "destructive",
-        });
-      }
-    });
-    return () => setUnauthorizedHandler(() => undefined);
-  }, [toast]);
 
   useEffect(() => {
     if (!video) return;
@@ -265,14 +250,11 @@ const Index = () => {
       });
     } catch (error) {
       console.error("Processing failed", error);
-      // On a 401 the interceptor already raised the password toast.
-      if (!isUnauthorizedError(error)) {
-        toast({
-          title: "Processing failed",
-          description: error instanceof Error ? error.message : "There was an error processing your video.",
-          variant: "destructive",
-        });
-      }
+      toast({
+        title: "Processing failed",
+        description: errorMessage(error, "There was an error processing your video."),
+        variant: "destructive",
+      });
     } finally {
       setLoading(false);
       setStage(null);
@@ -300,16 +282,32 @@ const Index = () => {
       });
     } catch (error) {
       console.error("URL processing failed", error);
-      if (!isUnauthorizedError(error)) {
-        toast({
-          title: "Processing failed",
-          description: error instanceof Error ? error.message : "There was an error processing that link.",
-          variant: "destructive",
-        });
-      }
+      toast({
+        title: "Processing failed",
+        description: errorMessage(error, "There was an error processing that link."),
+        variant: "destructive",
+      });
     } finally {
       setLoading(false);
       setStage(null);
+    }
+  };
+
+  const handleRegenerate = async () => {
+    if (!videoHash || regenerating) return;
+    setRegenerating(true);
+    try {
+      setSummary(await resummarize(videoHash));
+      toast({ title: "Summary regenerated" });
+    } catch (error) {
+      console.error("Resummarize failed", error);
+      toast({
+        title: "Could not regenerate the summary",
+        description: errorMessage(error, "Please try again."),
+        variant: "destructive",
+      });
+    } finally {
+      setRegenerating(false);
     }
   };
 
@@ -406,7 +404,12 @@ const Index = () => {
               />
             </div>
             <div className="max-md:order-4">
-              <SummaryPanel summary={summary} onSeek={seekTo} />
+              <SummaryPanel
+                summary={summary}
+                onSeek={seekTo}
+                onRegenerate={handleRegenerate}
+                regenerating={regenerating}
+              />
             </div>
           </div>
         </div>

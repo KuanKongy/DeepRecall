@@ -3,6 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { AlignLeft, Copy, Download, LocateFixed } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { TranscriptSegment } from "@/lib/api";
 import { fmtTime } from "@/lib/fmtTime";
 import { downloadFile, transcriptToSrt, transcriptToTxt } from "@/lib/exportTranscript";
@@ -50,9 +51,16 @@ const TranscriptPanel = ({ transcript, currentTime, onSeek }: TranscriptPanelPro
     <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between gap-2">
-          <CardTitle className="text-xl flex items-center gap-2">
-            <AlignLeft className="h-5 w-5" /> Transcript
-          </CardTitle>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <CardTitle className="text-xl flex items-center gap-2 cursor-help">
+                <AlignLeft className="h-5 w-5" /> Transcript
+              </CardTitle>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              Full timestamped transcript — click a line to jump the video there.
+            </TooltipContent>
+          </Tooltip>
           {transcript.length > 0 && (
             <div className="flex items-center gap-1">
               <Button

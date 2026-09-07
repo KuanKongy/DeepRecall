@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import glob
-import hmac
 import time
 import uuid
 import random
@@ -24,7 +23,7 @@ import urllib.request
 import tempfile
 import threading
 import numpy as np
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -137,17 +136,55 @@ DEFAULT_BACKEND = (
     else (AVAILABLE_BACKENDS[0] if AVAILABLE_BACKENDS else None)
 )
 
-APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))  # 3 hours
+
+# ---------------------------------------------------------------------------
+# Per-IP rate limit on the endpoints that spend model money. In-memory is
+# correct here for the same reason as the job registry: gunicorn --workers 1.
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_JOBS_PER_HOUR = int(os.getenv("RATE_LIMIT_JOBS_PER_HOUR", "10"))  # 0 disables
+_RATE_LIMIT_MSG = (
+    f"Rate limit reached: {RATE_LIMIT_JOBS_PER_HOUR} video analyses per hour. "
+    "Try again later."
+)
+_rate_buckets = {}
+_rate_lock = threading.Lock()
 
 
-@app.before_request
-def require_password():
-    """Shared-password gate; an unset APP_PASSWORD disables it (local dev)."""
-    if not APP_PASSWORD or request.method == "OPTIONS" or request.path in ("/", "/health"):
-        return None
-    if not hmac.compare_digest(request.headers.get("X-App-Password", ""), APP_PASSWORD):
-        return jsonify({"error": "Unauthorized"}), 401
-    return None
+def _client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _claim_job_slot(ip):
+    """Take one analysis slot for this IP; False when the hourly cap is hit."""
+    if RATE_LIMIT_JOBS_PER_HOUR <= 0:
+        return True
+    now = time.time()
+    with _rate_lock:
+        bucket = _rate_buckets.setdefault(ip, deque())
+        while bucket and now - bucket[0] > 3600:
+            bucket.popleft()
+        for stale in [key for key, entries in _rate_buckets.items() if not entries]:
+            if stale != ip:
+                del _rate_buckets[stale]
+        if len(bucket) >= RATE_LIMIT_JOBS_PER_HOUR:
+            return False
+        bucket.append(now)
+        return True
+
+
+def _release_job_slot(ip):
+    """Give back a slot when no new analysis actually started (dedupe/error)."""
+    if RATE_LIMIT_JOBS_PER_HOUR <= 0:
+        return
+    with _rate_lock:
+        bucket = _rate_buckets.get(ip)
+        if bucket:
+            bucket.pop()
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +291,12 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
             audio_path = extract_audio(upload_path, workdir)
             if upload_path != audio_path and os.path.exists(upload_path):
                 os.remove(upload_path)  # a raw video can be ~1 GB; free it now
+
+            duration = _probe_duration(audio_path)
+            if duration and duration > MAX_DURATION_SECONDS:
+                raise RuntimeError(
+                    f"Video is longer than {MAX_DURATION_SECONDS // 3600} hours — not supported."
+                )
 
             _update_job(job_id, stage="transcribing", message="Transcribing")
 
@@ -384,6 +427,10 @@ def _download_with_ytdlp(url, workdir, progress=None):
         "noplaylist": True,
         "progress_hooks": [hook],
         "max_filesize": app.config["MAX_CONTENT_LENGTH"],
+        # Reject over-long videos before spending bandwidth on them.
+        "match_filter": yt_dlp.utils.match_filter_func(
+            f"duration < {MAX_DURATION_SECONDS}"
+        ),
     }
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
@@ -396,7 +443,7 @@ def _download_with_ytdlp(url, workdir, progress=None):
 def _assert_public_host(url):
     """SSRF guard for direct downloads: http(s) only, and the host must not
     resolve to a private/loopback/link-local address. (Best-effort: a
-    password-gated app, not a multi-tenant proxy.)"""
+    small public app, not a multi-tenant proxy.)"""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise RuntimeError("Only http(s) URLs are supported.")
@@ -819,6 +866,10 @@ def process_video():
     if client_hash and not SHA256_RE.match(client_hash):
         return jsonify({"error": "video_hash must be a 64-char hex SHA-256."}), 400
 
+    ip = _client_ip()
+    if not _claim_job_slot(ip):
+        return jsonify({"error": _RATE_LIMIT_MSG}), 429
+
     workdir = tempfile.mkdtemp(prefix="deeprecall-")
     try:
         upload = request.files['file']
@@ -832,12 +883,15 @@ def process_video():
         video_key = f"{sha256}:{backend}"
 
         job_id, deduplicated = start_job(video_key, backend, upload_path, workdir)
+        if deduplicated:
+            _release_job_slot(ip)  # attached to a running job; no new spend
         return jsonify({
             "job_id": job_id,
             "video_hash": video_key,
             "deduplicated": deduplicated,
         }), 202
     except Exception as e:
+        _release_job_slot(ip)
         shutil.rmtree(workdir, ignore_errors=True)
         print(f"❌ Error accepting upload: {e}")
         return jsonify({"error": f"Failed to accept upload: {e}"}), 500
@@ -859,14 +913,48 @@ def process_url():
                      f"Available: {', '.join(AVAILABLE_BACKENDS) or 'none'}"
         }), 400
 
+    ip = _client_ip()
+    if not _claim_job_slot(ip):
+        return jsonify({"error": _RATE_LIMIT_MSG}), 429
+
     workdir = tempfile.mkdtemp(prefix="deeprecall-")
     try:
         job_id, deduplicated = start_url_job(url, backend, workdir)
+        if deduplicated:
+            _release_job_slot(ip)  # attached to a running job; no new spend
         return jsonify({"job_id": job_id, "deduplicated": deduplicated}), 202
     except Exception as e:
+        _release_job_slot(ip)
         shutil.rmtree(workdir, ignore_errors=True)
         print(f"❌ Error accepting URL: {e}")
         return jsonify({"error": f"Failed to accept URL: {e}"}), 500
+
+
+@app.route('/resummarize', methods=['POST'])
+def resummarize():
+    """Regenerates the summary for an already-transcribed video. Costs a model
+    call, so it shares the per-IP analysis rate limit."""
+    data = request.json or {}
+    video_key = data.get("video_hash", "")
+    if not video_key:
+        return jsonify({"error": "video_hash is required."}), 400
+    transcript_raw = cache.get(f"transcript:{video_key}")
+    if not transcript_raw:
+        return jsonify({"error": "Transcript expired — re-process the video first."}), 404
+
+    ip = _client_ip()
+    if not _claim_job_slot(ip):
+        return jsonify({"error": _RATE_LIMIT_MSG}), 429
+    try:
+        transcript = json.loads(transcript_raw)
+        short_summary, detailed_summary = summarize_text(transcript)
+        summary = {"short": short_summary, "detailed": detailed_summary}
+        cache.setex(f"summary:{video_key}", CACHE_TTL, json.dumps(summary))
+        return jsonify({"summary": summary})
+    except Exception as e:
+        _release_job_slot(ip)
+        print(f"❌ Error regenerating summary: {e}")
+        return jsonify({"error": f"Failed to regenerate summary: {e}"}), 500
 
 
 @app.route('/jobs/<job_id>')

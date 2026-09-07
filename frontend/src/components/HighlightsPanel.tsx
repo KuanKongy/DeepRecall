@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { ListFilter } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { TranscriptSegment } from "@/lib/api";
 import { fmtTime } from "@/lib/fmtTime";
 
@@ -64,9 +65,16 @@ const HighlightsPanel = ({ transcript, onSeek }: HighlightsPanelProps) => {
   return (
     <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
       <CardHeader className="pb-2">
-        <CardTitle className="text-xl flex items-center gap-2">
-          <ListFilter className="h-5 w-5" /> Keyword Highlights
-        </CardTitle>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <CardTitle className="text-xl flex items-center gap-2 cursor-help">
+              <ListFilter className="h-5 w-5" /> Keyword Highlights
+            </CardTitle>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-xs">
+            Lists every transcript line containing your exact keywords.
+          </TooltipContent>
+        </Tooltip>
       </CardHeader>
       <CardContent>
         <div className="space-y-4">

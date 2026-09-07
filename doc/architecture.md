@@ -29,8 +29,8 @@ The browser does the heavy lifting before a byte is uploaded:
 
 The backend dropdown is built from `GET /health` (`available_backends`) and
 hidden when only one backend exists. A settings popover stores a server URL
-and password in `localStorage`, applied per request through an axios
-interceptor — the hosted page can target a backend on your own machine at
+in `localStorage`, applied per request through an axios interceptor — the
+hosted page can target a backend on your own machine at
 `http://localhost:10000` (localhost is exempt from mixed-content blocking in
 Chrome/Firefox).
 
@@ -122,14 +122,23 @@ with values coerced to bytes on write so callers see identical types either
 way. Cache keys include the backend, so a local transcript never masks an
 API one. `GET /health` reports the cache mode and a live Redis ping.
 
-## Security
+## Abuse limits
 
-- `APP_PASSWORD` gates every route except `/`, `/health` and CORS preflight;
-  clients send it as `X-App-Password`, compared with `hmac.compare_digest`.
-  Unset means no auth (local dev).
-- `CORS_ORIGINS` is a comma-separated origin allowlist.
+The app is open — no accounts, no password. Spend is bounded instead:
+
+- A per-IP rate limit (default 10 analyses/hour, `RATE_LIMIT_JOBS_PER_HOUR`)
+  on the endpoints that cost model money: `/process_video`, `/process_url`
+  and `/resummarize`. Attaching to an already-running job for the same video
+  doesn't consume a slot; searches and polling are unlimited. In-memory,
+  which is correct under the single-worker deployment; the client IP comes
+  from `X-Forwarded-For` behind the platform proxy.
+- Videos longer than `MAX_DURATION_SECONDS` (default 3 h) are rejected after
+  audio extraction, and yt-dlp filters them out before downloading.
 - `MAX_CONTENT_LENGTH` (default 2 GB) turns oversized uploads into a 413
-  instead of filling the disk.
+  instead of filling the disk; `CORS_ORIGINS` is a comma-separated browser
+  origin allowlist.
+- The final backstop is provider-side: OpenRouter is prepaid (spend stops at
+  the credit balance) and OpenAI supports a monthly budget cap.
 
 ## Deployment
 
