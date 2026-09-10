@@ -42,7 +42,16 @@ type PlayerSource =
   | { kind: "youtube"; id: string }
   | null;
 
+function formatEta(seconds: number): string {
+  if (seconds < 5) return "almost done";
+  if (seconds < 90) return `~${Math.max(5, Math.round(seconds / 5) * 5)}s left`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `~${minutes}m left`;
+  return `~${Math.floor(minutes / 60)}h ${minutes % 60}m left`;
+}
+
 function describeJob(job: JobRecord): StageInfo {
+  const eta = job.eta != null ? ` · ${formatEta(job.eta)}` : "";
   switch (job.stage) {
     case "queued":
       return { label: "Queued on server", fraction: null, detail: null };
@@ -51,7 +60,7 @@ function describeJob(job: JobRecord): StageInfo {
         return {
           label: "Downloading on server",
           fraction: job.progress.current / job.progress.total,
-          detail: `${(job.progress.current / 1e6).toFixed(0)}/${(job.progress.total / 1e6).toFixed(0)} MB`,
+          detail: `${(job.progress.current / 1e6).toFixed(0)}/${(job.progress.total / 1e6).toFixed(0)} MB${eta}`,
         };
       }
       return { label: "Downloading on server", fraction: null, detail: null };
@@ -62,7 +71,7 @@ function describeJob(job: JobRecord): StageInfo {
         return {
           label: "Transcribing",
           fraction: job.progress.current / job.progress.total,
-          detail: `${job.progress.current}/${job.progress.total}`,
+          detail: `${job.progress.current}/${job.progress.total}${eta}`,
         };
       }
       return { label: "Transcribing", fraction: null, detail: null };

@@ -361,7 +361,17 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
         stage_start = now
         if stage in ("done", "error"):
             timings["total"] = round(now - t0, 1)
-        _update_job(job_id, stage=stage, timings=timings, **updates)
+        _update_job(job_id, stage=stage, timings=timings, eta=None, **updates)
+
+    def stage_progress(current, total):
+        # Rate-based remaining-time estimate for the current stage; held back
+        # for the first seconds so it doesn't jump around while the rate is
+        # still meaningless.
+        updates = {"progress": {"current": current, "total": total}}
+        elapsed = time.monotonic() - stage_start
+        if current and total and elapsed >= 3:
+            updates["eta"] = max(0, round(elapsed * (total - current) / current))
+        _update_job(job_id, **updates)
 
     try:
         if source_url:
@@ -376,11 +386,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
 
             if sha256 is None:
                 set_stage("downloading", status="running", message="Downloading")
-
-                def dl_progress(current, total):
-                    _update_job(job_id, progress={"current": current, "total": total})
-
-                upload_path = _download_source(source_url, workdir, dl_progress)
+                upload_path = _download_source(source_url, workdir, stage_progress)
                 sha256 = get_video_hash(upload_path)
                 cache.setex(f"urlsha:{url_key}", CACHE_TTL, sha256)
 
@@ -411,11 +417,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
                     os.remove(upload_path)  # a raw video can be ~1 GB; free it now
 
             set_stage("transcribing", message="Transcribing")
-
-            def progress(current, total):
-                _update_job(job_id, progress={"current": current, "total": total})
-
-            transcript = transcribe_audio(audio_path, backend, workdir, progress)
+            transcript = transcribe_audio(audio_path, backend, workdir, stage_progress)
             if not transcript:
                 raise RuntimeError("Transcription produced no segments.")
             cache.setex(f"transcript:{video_key}", CACHE_TTL, json.dumps(transcript))
