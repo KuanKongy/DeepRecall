@@ -76,12 +76,44 @@ class MemoryCache:
         return True
 
 
+class NamespacedCache:
+    """Appends ':<REDIS_SUFFIX>' to every key so a test or staging run can
+    share the production Redis without reading or writing its entries."""
+
+    def __init__(self, inner, suffix):
+        self._inner = inner
+        self._suffix = suffix
+
+    def _key(self, key):
+        return f"{key}:{self._suffix}"
+
+    def get(self, key):
+        return self._inner.get(self._key(key))
+
+    def setex(self, key, ttl, value):
+        return self._inner.setex(self._key(key), ttl, value)
+
+    def exists(self, key):
+        return self._inner.exists(self._key(key))
+
+    def delete(self, key):
+        return self._inner.delete(self._key(key))
+
+    def ping(self):
+        return self._inner.ping()
+
+
 def make_cache():
     redis_url = os.getenv("REDIS_URL")
     if redis_url:
         # Upstash hands out rediss:// TLS URLs; redis-py handles them natively.
-        return redis.from_url(redis_url), "redis"
-    return MemoryCache(), "memory"
+        client, mode = redis.from_url(redis_url), "redis"
+    else:
+        client, mode = MemoryCache(), "memory"
+    suffix = os.getenv("REDIS_SUFFIX", "").strip()
+    if suffix:
+        client = NamespacedCache(client, suffix)
+    return client, mode
 
 
 cache, CACHE_MODE = make_cache()
@@ -309,6 +341,24 @@ def start_job(video_key, backend, upload_path, workdir):
 def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=None, url_key=None):
     """The whole pipeline off-request. Every stage checks its cache key first,
     so re-submitting after a crash resumes from the last completed stage."""
+    t0 = time.monotonic()
+    timings = {}
+    current_stage = None
+    stage_start = t0
+
+    def set_stage(stage, **updates):
+        # Closes out the previous stage's duration; "timings" rides along on
+        # the job record so /jobs/<id> reports per-stage seconds.
+        nonlocal current_stage, stage_start
+        now = time.monotonic()
+        if current_stage is not None:
+            timings[current_stage] = round(now - stage_start, 1)
+        current_stage = None if stage in ("done", "error") else stage
+        stage_start = now
+        if stage in ("done", "error"):
+            timings["total"] = round(now - t0, 1)
+        _update_job(job_id, stage=stage, timings=timings, **updates)
+
     try:
         if source_url:
             # A URL seen before whose results are all still cached needs no
@@ -321,7 +371,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
                     sha256 = known_sha
 
             if sha256 is None:
-                _update_job(job_id, status="running", stage="downloading", message="Downloading")
+                set_stage("downloading", status="running", message="Downloading")
 
                 def dl_progress(current, total):
                     _update_job(job_id, progress={"current": current, "total": total})
@@ -335,7 +385,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
             _update_job(job_id, sha256=sha256, video_hash=video_key, progress=None)
             cache.setex(f"jobfor:{video_key}", JOB_TTL, job_id)
 
-        _update_job(job_id, status="running", stage="extracting", message="Extracting audio")
+        set_stage("extracting", status="running", message="Extracting audio")
 
         transcript_raw = cache.get(f"transcript:{video_key}")
         if transcript_raw:
@@ -351,7 +401,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
                     f"Video is longer than {MAX_DURATION_SECONDS // 3600} hours, not supported."
                 )
 
-            _update_job(job_id, stage="transcribing", message="Transcribing")
+            set_stage("transcribing", message="Transcribing")
 
             def progress(current, total):
                 _update_job(job_id, progress={"current": current, "total": total})
@@ -361,7 +411,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
                 raise RuntimeError("Transcription produced no segments.")
             cache.setex(f"transcript:{video_key}", CACHE_TTL, json.dumps(transcript))
 
-        _update_job(job_id, stage="summarizing", progress=None, message="Summarizing")
+        set_stage("summarizing", progress=None, message="Summarizing")
         if not cache.get(f"summary:{video_key}"):
             short_summary, detailed_summary = summarize_text(transcript)
             cache.setex(
@@ -370,15 +420,15 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
                 json.dumps({"short": short_summary, "detailed": detailed_summary}),
             )
 
-        _update_job(job_id, stage="indexing", message="Building search index")
+        set_stage("indexing", message="Building search index")
         if not (cache.exists(f"search:{video_key}") and cache.exists(f"searchvec:{video_key}")):
             if not create_search_index(transcript, video_key):
                 raise RuntimeError("Failed to generate embeddings.")
 
-        _update_job(job_id, status="done", stage="done", message="Complete")
+        set_stage("done", status="done", message="Complete")
     except Exception as e:
         print(f"❌ Job {job_id} failed: {e}")
-        _update_job(job_id, status="error", stage="error", error=str(e), message="Failed")
+        set_stage("error", status="error", error=str(e), message="Failed")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         if video_key:

@@ -130,6 +130,38 @@ returns the top k (clamped 1–20) hits with timestamps and scores. An
 in-process LRU (~20 videos) keeps loaded vector arrays out of repeated
 cache reads.
 
+## Measured performance
+
+One full run per backend on the same test video, CS50x 2024 Lecture 1 - C
+(youtube.com/watch?v=cwtpLIWylAw, 2:27:41 = 8861 s), measured 2026-09-09 on
+an Apple M1 Pro (16 GB, macOS 26.5) running `python app.py`. Per-stage
+seconds come from the job record's `timings` field, which `run_pipeline`
+fills in as each stage completes. Downloading is the audio-only yt-dlp fetch
+and extracting is the ffmpeg transcode to 16 kHz mono mp3; both are roughly
+constant across backends, so the spread is almost entirely transcription.
+
+- **api** (OpenRouter `whisper-large-v3`, 10-minute chunks, 6 workers,
+  Upstash Redis over TLS): download 60 s, extract 22 s, transcribe 43 s
+  (208x realtime), summarize 8 s, index 2 s. Total 2 m 15 s, 66x realtime
+  end to end.
+- **mlx** (`whisper-large-v3-turbo` on the M1 Pro GPU, one unchunked call
+  that includes loading the model): download 22 s, extract 22 s, transcribe
+  7 m 38 s (19x realtime), summarize 9 s, index 1 s. Total 8 m 32 s.
+- **local** (faster-whisper `base` int8 on CPU): download 20 s, extract
+  23 s, transcribe 5 m 58 s (25x realtime), summarize 8 s, index 2 s.
+  Total 6 m 49 s.
+
+Re-submitting the same URL and backend right after takes 2.6 s end to end:
+the `urlsha` pointer plus the fully-cached check skip the download and every
+stage resolves to a cache hit, so the remaining time is mostly Upstash round
+trips.
+
+These numbers compare speed, not accuracy. Each backend runs a different
+Whisper model, which is why `local` beats `mlx` here: `base` is a far
+smaller model than `large-v3-turbo` and pays for it in transcript quality.
+Download time is network-dependent (20-60 s across these runs), and the
+`api` figure depends on where OpenRouter routes the chunks that day.
+
 ## Caching
 
 `make_cache()` returns a Redis client when `REDIS_URL` is set (TLS
@@ -137,7 +169,10 @@ cache reads.
 exposing the same five methods (`get`, `setex`, `exists`, `delete`, `ping`)
 with values coerced to bytes on write so callers see identical types either
 way. Cache keys include the backend, so a local transcript never masks an
-API one. `GET /health` reports the cache mode and a live Redis ping.
+API one. Setting `REDIS_SUFFIX` appends `:suffix` to every key, letting a
+test or staging run share the production Redis without reading or writing
+its entries (the benchmark above ran against the live instance this way).
+`GET /health` reports the cache mode and a live Redis ping.
 
 ## Abuse limits
 

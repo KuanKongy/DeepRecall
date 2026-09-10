@@ -55,6 +55,7 @@ export interface JobRecord {
   source_url?: string | null;
   youtube_id?: string | null;
   error: string | null;
+  timings?: Record<string, number>;
 }
 
 // tsconfig has strict:false, so truthiness does not narrow this union;
