@@ -96,24 +96,37 @@ would load the MLX runtime):
 
 - **api** — any OpenAI-compatible hosted endpoint; by default OpenRouter's
   `openai/whisper-large-v3`, which load-balances across Groq, DeepInfra and
-  Together (`TRANSCRIBE_BASE_URL` / `TRANSCRIBE_MODEL` override it). Audio is
-  transcoded to 16 kHz mono 32 kbps MP3 (~14 MB/hour, under the 25 MB/file
-  limit), split into 10-minute chunks (stream copy) and transcribed with 6
-  workers in parallel. Chunks under ~1 s are dropped (the API rejects audio
-  shorter than 0.1 s) and results are keyed by chunk index so ordering
-  survives out-of-order completion. Calls retry with exponential backoff on
-  429/5xx; with `TRANSCRIBE_FALLBACK=openai`, a chunk that stays
-  rate-limited (or fails auth) is re-run on OpenAI `whisper-1`.
+  Together (`TRANSCRIBE_BASE_URL` / `TRANSCRIBE_MODEL` override it). One
+  ffmpeg process segment-transcodes the source into 10-minute 16 kHz mono
+  32 kbps MP3 chunks (~2.4 MB each, under the 25 MB/file limit), and each
+  chunk is submitted to the upload pool (`TRANSCRIBE_MAX_WORKERS`, default
+  6) the moment ffmpeg finishes writing it, so extraction and transcription
+  overlap. Chunks under ~1 s are dropped (the API rejects audio shorter
+  than 0.1 s) and results are keyed by chunk index so ordering survives
+  out-of-order completion. Calls retry with exponential backoff on 429/5xx;
+  with `TRANSCRIBE_FALLBACK=openai`, a chunk that stays rate-limited (or
+  fails auth) is re-run on OpenAI `whisper-1`.
 - **mlx** — `mlx-whisper` on the Apple Silicon GPU (darwin/arm64 only).
-- **local** — `faster-whisper` base int8 on CPU. Kept out of the server
-  image (`requirements-local.txt`): ctranslate2 + onnxruntime add hundreds
-  of MB, and a shared vCPU transcribes slower and dearer than the API.
+  The audio is cut into clips at silences of at least `MLX_VAD_GAP_SECONDS`
+  (Silero VAD, bundled with faster-whisper) and each clip is decoded
+  without conditioning on previous text: cuts never land mid-speech, long
+  silences are never decoded, repetition loops cannot propagate across
+  clips, and clip completion drives the progress bar. Clips run
+  sequentially — true batched decoding measured 1.01x here because a single
+  large-v3-turbo encoder pass already saturates the GPU. The language is
+  detected once on the first clip and reused.
+- **local** — `faster-whisper` base int8 on CPU (`LOCAL_CPU_THREADS`
+  overrides the CTranslate2 default). Kept out of the server image
+  (`requirements-local.txt`): ctranslate2 + onnxruntime add hundreds of MB,
+  and a shared vCPU transcribes slower and dearer than the API.
 
 ## Summaries
 
 `SUMMARY_MODEL` (default `gpt-4.1-nano`, 1 M context) writes a short and a
 detailed summary in parallel, in a single pass — no map-reduce, just a hard
-guard at ~800k tokens. The transcript is fed as `[mm:ss] text` lines and the
+guard at ~800k tokens. The summary and the search index are built
+concurrently once the transcript exists; the pipeline still reports the
+stages in order, with "indexing" showing only the residual. The transcript is fed as `[mm:ss] text` lines and the
 detailed prompt asks for Markdown with a closing `## Key moments` section
 citing those timestamps. The UI renders both with react-markdown.
 
@@ -133,20 +146,28 @@ cache reads.
 ## Measured performance
 
 One full run per backend on the same test video, CS50x 2024 Lecture 1 - C
-(youtube.com/watch?v=cwtpLIWylAw, 2:27:41 = 8861 s), measured 2026-09-09 on
-an Apple M1 Pro (16 GB, macOS 26.5) running `python app.py`. Per-stage
-seconds come from the job record's `timings` field, which `run_pipeline`
-fills in as each stage completes. Downloading is the audio-only yt-dlp fetch
-and extracting is the ffmpeg transcode to 16 kHz mono mp3; both are roughly
-constant across backends, so the spread is almost entirely transcription.
+(youtube.com/watch?v=cwtpLIWylAw, 2:27:41 = 8861 s), measured on an Apple
+M1 Pro (16 GB, macOS 26.5) running `python app.py`; api and mlx re-measured
+2026-09-10 after the extract/transcribe overlap and the VAD clip decoding
+landed, local and the warm re-run from 2026-09-09. Per-stage seconds come
+from the job record's `timings` field, which `run_pipeline` fills in as
+each stage completes. Downloading is the audio-only yt-dlp fetch; for api
+the extraction happens inside the transcribing stage.
 
 - **api** (OpenRouter `whisper-large-v3`, 10-minute chunks, 6 workers,
-  Upstash Redis over TLS): download 60 s, extract 22 s, transcribe 43 s
-  (208x realtime), summarize 8 s, index 2 s. Total 2 m 15 s, 66x realtime
-  end to end.
-- **mlx** (`whisper-large-v3-turbo` on the M1 Pro GPU, one unchunked call
-  that includes loading the model): download 22 s, extract 22 s, transcribe
-  7 m 38 s (19x realtime), summarize 9 s, index 1 s. Total 8 m 32 s.
+  Upstash Redis over TLS): download 55 s, then transcode + transcribe
+  overlapped in 26 s (336x realtime), summarize 8 s, index 0.2 s residual.
+  Total 1 m 30 s, 98x realtime end to end — down from 2 m 15 s before the
+  overlap, when extraction alone took 22 s.
+- **mlx** (`whisper-large-v3-turbo` on the M1 Pro GPU, VAD clips, no
+  conditioning, includes model load): download 15 s, extract 22 s,
+  transcribe 6 m 20 s of which ~29 s is VAD (23x realtime), summarize 13 s,
+  index 0 s residual. Total 7 m 10 s. A same-day baseline with the old
+  single conditioned call took 7 m 51 s: the clip decoding is ~10 % faster
+  here — dropping the conditioning helps far less on turbo's 4-layer
+  decoder than its 2.26x showing on a short repetition-prone clip — and
+  the eval found no quality cost (word coverage within 0.6 %, identical
+  term counts, one repetition loop instead of two).
 - **local** (faster-whisper `base` int8 on CPU): download 20 s, extract
   23 s, transcribe 5 m 58 s (25x realtime), summarize 8 s, index 2 s.
   Total 6 m 49 s.
@@ -159,7 +180,7 @@ trips.
 These numbers compare speed, not accuracy. Each backend runs a different
 Whisper model, which is why `local` beats `mlx` here: `base` is a far
 smaller model than `large-v3-turbo` and pays for it in transcript quality.
-Download time is network-dependent (20-60 s across these runs), and the
+Download time is network-dependent (15-60 s across these runs), and the
 `api` figure depends on where OpenRouter routes the chunks that day.
 
 ## Caching

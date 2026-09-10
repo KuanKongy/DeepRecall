@@ -2,3 +2,5 @@
 # Install alongside the base requirements:
 #   pip install -r requirements.txt -r requirements-mac.txt
 mlx-whisper
+# Also provides the bundled Silero VAD the mlx backend cuts clips with.
+faster-whisper

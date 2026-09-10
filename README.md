@@ -31,6 +31,9 @@ Copy `.env.sample` to `.env` and fill in:
 | `SUMMARY_MODEL` | Chat model for summaries (default `gpt-4.1-nano`) |
 | `REDIS_URL` | Optional; `rediss://…` from Upstash. Unset = memory cache |
 | `REDIS_SUFFIX` | Optional; appended to every cache key so test runs can share the production Redis |
+| `TRANSCRIBE_MAX_WORKERS` | Parallel chunk uploads per job on the `api` backend (default 6) |
+| `MLX_VAD_GAP_SECONDS` | `mlx` backend cuts clips only inside silences at least this long (default 5) |
+| `LOCAL_CPU_THREADS` | CPU threads for the `local` backend (default 0 = CTranslate2 default) |
 | `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY` | Per-IP analyses (defaults 10/hour, 20/day; 0 disables) |
 | `MAX_DURATION_SECONDS` | Longest accepted video (default 10800 = 3 h) |
 | `CORS_ORIGINS` | Comma-separated origin allowlist (include the custom Pages domain) |

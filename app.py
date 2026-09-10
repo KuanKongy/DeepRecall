@@ -134,8 +134,12 @@ EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "512"))
 TRANSCRIBE_BASE_URL = os.getenv("TRANSCRIBE_BASE_URL", "https://openrouter.ai/api/v1")
 TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "openai/whisper-large-v3")
 MLX_WHISPER_MODEL = os.getenv("MLX_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
+# Speech regions closer than this are transcribed as one clip; the mlx backend
+# only ever cuts the audio inside a silence at least this long.
+MLX_VAD_GAP_SECONDS = float(os.getenv("MLX_VAD_GAP_SECONDS", "5"))
 CHUNK_SECONDS = int(os.getenv("CHUNK_SECONDS", "600"))
-TRANSCRIBE_MAX_WORKERS = 6  # parallel chunk uploads per job
+TRANSCRIBE_MAX_WORKERS = int(os.getenv("TRANSCRIBE_MAX_WORKERS", "6"))  # parallel chunk uploads per job
+LOCAL_CPU_THREADS = int(os.getenv("LOCAL_CPU_THREADS", "0"))  # 0 = CTranslate2 default
 # "openai" re-runs a chunk on whisper-1 when the API stays rate-limited.
 TRANSCRIBE_FALLBACK = os.getenv("TRANSCRIBE_FALLBACK", "").lower()
 
@@ -391,15 +395,20 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
         if transcript_raw:
             transcript = json.loads(transcript_raw)
         else:
-            audio_path = extract_audio(upload_path, workdir)
-            if upload_path != audio_path and os.path.exists(upload_path):
-                os.remove(upload_path)  # a raw video can be ~1 GB; free it now
-
-            duration = _probe_duration(audio_path)
+            duration = _probe_duration(upload_path)
             if duration and duration > MAX_DURATION_SECONDS:
                 raise RuntimeError(
                     f"Video is longer than {MAX_DURATION_SECONDS // 3600} hours, not supported."
                 )
+
+            if backend == "api":
+                # The api path segment-transcodes straight from the source
+                # inside _transcribe_api, overlapping extraction with uploads.
+                audio_path = upload_path
+            else:
+                audio_path = extract_audio(upload_path, workdir)
+                if upload_path != audio_path and os.path.exists(upload_path):
+                    os.remove(upload_path)  # a raw video can be ~1 GB; free it now
 
             set_stage("transcribing", message="Transcribing")
 
@@ -411,18 +420,33 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
                 raise RuntimeError("Transcription produced no segments.")
             cache.setex(f"transcript:{video_key}", CACHE_TTL, json.dumps(transcript))
 
-        set_stage("summarizing", progress=None, message="Summarizing")
-        if not cache.get(f"summary:{video_key}"):
-            short_summary, detailed_summary = summarize_text(transcript)
-            cache.setex(
-                f"summary:{video_key}",
-                CACHE_TTL,
-                json.dumps({"short": short_summary, "detailed": detailed_summary}),
+        need_summary = not cache.get(f"summary:{video_key}")
+        need_index = not (
+            cache.exists(f"search:{video_key}") and cache.exists(f"searchvec:{video_key}")
+        )
+        # Both read only the finished transcript, so they run concurrently;
+        # the stages still report in order and "indexing" shows the residual.
+        with ThreadPoolExecutor(max_workers=2) as stage_pool:
+            summary_future = (
+                stage_pool.submit(summarize_text, transcript) if need_summary else None
+            )
+            index_future = (
+                stage_pool.submit(create_search_index, transcript, video_key)
+                if need_index
+                else None
             )
 
-        set_stage("indexing", message="Building search index")
-        if not (cache.exists(f"search:{video_key}") and cache.exists(f"searchvec:{video_key}")):
-            if not create_search_index(transcript, video_key):
+            set_stage("summarizing", progress=None, message="Summarizing")
+            if summary_future:
+                short_summary, detailed_summary = summary_future.result()
+                cache.setex(
+                    f"summary:{video_key}",
+                    CACHE_TTL,
+                    json.dumps({"short": short_summary, "detailed": detailed_summary}),
+                )
+
+            set_stage("indexing", message="Building search index")
+            if index_future and not index_future.result():
                 raise RuntimeError("Failed to generate embeddings.")
 
         set_stage("done", status="done", message="Complete")
@@ -718,15 +742,19 @@ def extract_audio(media_path, workdir):
     return audio_path
 
 
-def split_audio(audio_path, workdir, segment_seconds=CHUNK_SECONDS):
-    """Split audio into fixed-length chunks (stream copy, no re-encode)."""
+def segment_audio_async(media_path, workdir, segment_seconds=CHUNK_SECONDS):
+    """Transcode any ffmpeg input straight into fixed-length 16kHz mono mp3
+    chunks, returning the running process so chunks can be consumed while
+    later ones are still being written."""
     pattern = os.path.join(workdir, "chunk_%03d.mp3")
-    (
-        ffmpeg.input(audio_path)
-        .output(pattern, f="segment", segment_time=segment_seconds, c="copy")
-        .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+    return (
+        ffmpeg.input(media_path)
+        .output(pattern, f="segment", segment_time=segment_seconds,
+                vn=None, ac=1, ar=16000, audio_bitrate="32k")
+        .global_args("-nostdin", "-loglevel", "error")
+        .overwrite_output()
+        .run_async()
     )
-    return sorted(glob.glob(os.path.join(workdir, "chunk_*.mp3")))
 
 
 def _probe_duration(path):
@@ -782,42 +810,68 @@ def _transcribe_chunk_api(client, path, chunk_duration):
     return [{"start": 0.0, "end": end, "text": result.text}]
 
 
-def _transcribe_api(audio_path, workdir, progress=None):
-    """Chunk the audio and transcribe all chunks in parallel on the hosted API."""
+def _transcribe_api(media_path, workdir, progress=None):
+    """Segment-transcode the source and transcribe chunks in parallel on the
+    hosted API, submitting each chunk the moment ffmpeg finishes writing it
+    so extraction and uploads overlap."""
     client = get_api_client()
+    proc = segment_audio_async(media_path, workdir)
 
-    chunks = []
-    for path in split_audio(audio_path, workdir):
+    futures = {}
+
+    def submit_chunk(path, pool):
         index = int(re.search(r"chunk_(\d+)", os.path.basename(path)).group(1))
+        if index in futures:
+            return
         duration = _probe_duration(path)
         # The Whisper API rejects audio under 0.1s; a segment split can leave a
         # sub-second tail chunk that carries no speech worth keeping.
         if duration is not None and duration < 1.0:
-            continue
-        chunks.append((index, path, duration))
+            futures[index] = None
+            return
+        futures[index] = pool.submit(_transcribe_chunk_api, client, path, duration)
 
     results = {}
     completed = 0
     with ThreadPoolExecutor(max_workers=TRANSCRIBE_MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_transcribe_chunk_api, client, path, duration): index
-            for index, path, duration in chunks
-        }
+        # Chunk N is complete once chunk N+1 exists; the rest once ffmpeg exits.
+        while proc.poll() is None:
+            ready = sorted(glob.glob(os.path.join(workdir, "chunk_*.mp3")))
+            for path in ready[:-1]:
+                submit_chunk(path, pool)
+            time.sleep(0.5)
+        if proc.returncode != 0:
+            raise RuntimeError("Audio extraction failed.")
+        for path in sorted(glob.glob(os.path.join(workdir, "chunk_*.mp3"))):
+            submit_chunk(path, pool)
+        # The source is fully read once segmenting ends; a raw video can be
+        # ~1 GB, free it before the uploads finish.
+        if os.path.exists(media_path):
+            os.remove(media_path)
+
+        pending = {future: index for index, future in futures.items() if future}
         # Keyed by chunk index so ordering survives as_completed.
-        for future in as_completed(futures):
-            index = futures[future]
+        for future in as_completed(pending):
+            index = pending[future]
             results[index] = _segments_to_transcript(
                 future.result(), index * CHUNK_SECONDS
             )
             completed += 1
             if progress:
-                progress(completed, len(chunks))
+                progress(completed, len(pending))
 
     return [seg for index in sorted(results) for seg in results[index]]
 
 
-def _transcribe_mlx(audio_path):
-    """Local transcription on Apple Silicon's GPU via MLX (pip install mlx-whisper)."""
+def _transcribe_mlx(audio_path, progress=None):
+    """Local transcription on Apple Silicon's GPU via MLX (pip install mlx-whisper).
+
+    The audio is cut into clips at silences of at least MLX_VAD_GAP_SECONDS
+    (Silero VAD) and each clip is decoded without conditioning on previous
+    text: cuts never land mid-speech, long silences are never decoded, and
+    dropping the conditioning alone is a ~2x speedup. True batched decoding
+    measured 1.01x here (one large-v3-turbo encoder pass already saturates
+    the GPU), so clips run sequentially."""
     try:
         import mlx_whisper
     except ImportError:
@@ -825,11 +879,45 @@ def _transcribe_mlx(audio_path):
             "mlx-whisper is not installed. Run: pip install -r requirements-mac.txt "
             "(Apple Silicon only), or use the 'api' or 'local' backend."
         )
-    result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=MLX_WHISPER_MODEL)
-    return _segments_to_transcript(result["segments"])
+
+    audio = np.asarray(mlx_whisper.audio.load_audio(audio_path))
+    sample_rate = mlx_whisper.audio.SAMPLE_RATE
+    total_seconds = len(audio) / sample_rate
+
+    clips = []
+    try:
+        from faster_whisper.vad import get_speech_timestamps
+
+        for region in get_speech_timestamps(audio):
+            if clips and region["start"] - clips[-1][1] < MLX_VAD_GAP_SECONDS * sample_rate:
+                clips[-1][1] = region["end"]
+            else:
+                clips.append([region["start"], region["end"]])
+    except ImportError:
+        pass  # no faster-whisper (VAD lives in it): fall back to one clip
+    if not clips:
+        clips = [[0, len(audio)]]
+
+    language = None
+    transcript = []
+    for start, end in clips:
+        result = mlx_whisper.transcribe(
+            audio[start:end],
+            path_or_hf_repo=MLX_WHISPER_MODEL,
+            condition_on_previous_text=False,
+            language=language,
+        )
+        # Detect the language once on the first clip; re-detecting costs a
+        # full extra encoder pass per clip.
+        language = language or result.get("language")
+        transcript.extend(_segments_to_transcript(result["segments"], start / sample_rate))
+        if progress:
+            progress(int(end / sample_rate), int(total_seconds))
+    return transcript
 
 
 _faster_whisper_model = None
+_faster_whisper_lock = threading.Lock()
 
 
 def _transcribe_local(audio_path, progress=None):
@@ -837,8 +925,12 @@ def _transcribe_local(audio_path, progress=None):
     global _faster_whisper_model
     from faster_whisper import WhisperModel
 
-    if _faster_whisper_model is None:
-        _faster_whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    with _faster_whisper_lock:
+        if _faster_whisper_model is None:
+            _faster_whisper_model = WhisperModel(
+                "base", device="cpu", compute_type="int8",
+                cpu_threads=LOCAL_CPU_THREADS,
+            )
     segments, info = _faster_whisper_model.transcribe(audio_path)
     transcript = []
     for seg in segments:
@@ -852,7 +944,7 @@ def transcribe_audio(audio_path, backend, workdir, progress=None):
     if backend == "api":
         return _transcribe_api(audio_path, workdir, progress)
     if backend == "mlx":
-        return _transcribe_mlx(audio_path)  # MLX reports no incremental progress
+        return _transcribe_mlx(audio_path, progress)
     return _transcribe_local(audio_path, progress)
 
 
