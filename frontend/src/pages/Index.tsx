@@ -91,8 +91,9 @@ const Index = () => {
   // Direct playback first; on a media error retry through the server proxy
   // (hosts like GitHub serve videos as octet-stream, which browsers refuse).
   const [playback, setPlayback] = useState<"direct" | "proxy" | "failed">("direct");
+  // Canonical layout: Add a Video left, player + summary right; "mirrored" swaps them.
   const [mirrored, setMirrored] = useState<boolean>(
-    () => localStorage.getItem("deeprecall-mirror") === "1",
+    () => localStorage.getItem("deeprecall-columns") === "swapped",
   );
   const [videoHidden, setVideoHidden] = useState<boolean>(false);
   const hashPromiseRef = useRef<Promise<string> | null>(null);
@@ -341,7 +342,7 @@ const Index = () => {
 
   const toggleMirror = () => {
     setMirrored((value) => {
-      localStorage.setItem("deeprecall-mirror", value ? "0" : "1");
+      localStorage.setItem("deeprecall-columns", value ? "default" : "swapped");
       return !value;
     });
   };
@@ -407,7 +408,7 @@ const Index = () => {
         <div className="grid grid-cols-1 md:grid-cols-12 gap-3 md:flex-1 md:min-h-[430px]">
           <div
             className={`max-md:contents md:col-span-7 lg:col-span-8 md:flex md:flex-col md:gap-3 md:min-h-0 ${
-              mirrored ? "md:order-2" : "md:order-1"
+              mirrored ? "md:order-1" : "md:order-2"
             }`}
           >
             {playerSource && (
@@ -491,7 +492,7 @@ const Index = () => {
 
           <div
             className={`max-md:contents md:col-span-5 lg:col-span-4 md:flex md:flex-col md:gap-3 md:min-h-0 ${
-              mirrored ? "md:order-1" : "md:order-2"
+              mirrored ? "md:order-2" : "md:order-1"
             }`}
           >
             <div className="max-md:order-1 md:shrink-0">

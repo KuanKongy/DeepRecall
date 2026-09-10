@@ -33,10 +33,10 @@ jobs:
       - run: npm ci
       - name: Build
         run: |
-          # A repo variable (Settings → Secrets and variables → Actions →
-          # Variables → VITE_API_URL) overrides frontend/.env.production.
-          if [ -n "${{ vars.VITE_API_URL }}" ]; then
-            export VITE_API_URL="${{ vars.VITE_API_URL }}"
+          # A repo secret (Settings → Secrets and variables → Actions →
+          # Secrets → VITE_API_URL) overrides frontend/.env.production.
+          if [ -n "${{ secrets.VITE_API_URL }}" ]; then
+            export VITE_API_URL="${{ secrets.VITE_API_URL }}"
           fi
           npm run build
       - uses: actions/upload-pages-artifact@v3
