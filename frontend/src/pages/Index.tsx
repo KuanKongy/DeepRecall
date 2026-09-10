@@ -1,22 +1,23 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
-import { Sun, Moon } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Eye, EyeOff, FlipHorizontal2, PlayCircle, Sun, Moon } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
 import { useTheme } from "@/components/ThemeProvider";
+import BrandMark from "@/components/BrandMark";
 import UploadPanel, { type StageInfo } from "@/components/UploadPanel";
 import SearchPanel from "@/components/SearchPanel";
 import HighlightsPanel from "@/components/HighlightsPanel";
-import TranscriptPanel from "@/components/TranscriptPanel";
-import SummaryPanel from "@/components/SummaryPanel";
-import SettingsPopover from "@/components/SettingsPopover";
+import ResultsPanel from "@/components/ResultsPanel";
 import YouTubePlayer, { type YouTubeHandle } from "@/components/YouTubePlayer";
 import {
   errorMessage,
   getHealth,
   getJob,
   lookupCache,
+  mediaProxyUrl,
   processUrl,
   resummarize,
   submitMedia,
@@ -87,6 +88,13 @@ const Index = () => {
   const [precached, setPrecached] = useState<boolean>(false);
   const [regenerating, setRegenerating] = useState<boolean>(false);
   const [currentTime, setCurrentTime] = useState<number>(0);
+  // Direct playback first; on a media error retry through the server proxy
+  // (hosts like GitHub serve videos as octet-stream, which browsers refuse).
+  const [playback, setPlayback] = useState<"direct" | "proxy" | "failed">("direct");
+  const [mirrored, setMirrored] = useState<boolean>(
+    () => localStorage.getItem("deeprecall-mirror") === "1",
+  );
+  const [videoHidden, setVideoHidden] = useState<boolean>(false);
   const hashPromiseRef = useRef<Promise<string> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const youtubeRef = useRef<YouTubeHandle | null>(null);
@@ -112,6 +120,22 @@ const Index = () => {
     setPlayerSource({ kind: "file", src: url });
     return () => URL.revokeObjectURL(url);
   }, [video]);
+
+  useEffect(() => {
+    setPlayback("direct");
+  }, [playerSource]);
+
+  // A bad host can stall forever without ever firing an error event (GitHub
+  // serves videos as octet-stream + nosniff and Chrome just keeps loading).
+  // If no data has arrived shortly after mount, retry through the proxy.
+  useEffect(() => {
+    if (playerSource?.kind !== "url" || playback !== "direct") return;
+    const timer = window.setTimeout(() => {
+      const el = videoRef.current;
+      if (el && el.readyState === 0) setPlayback("proxy");
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [playerSource, playback]);
 
   const seekTo = useCallback((seconds: number) => {
     if (youtubeRef.current) {
@@ -198,7 +222,7 @@ const Index = () => {
         applyResult(lookup);
         toast({
           title: "Already processed",
-          description: "Loaded the cached results for this video — no upload needed.",
+          description: "Loaded the cached results for this video, no upload needed.",
         });
         return;
       }
@@ -221,7 +245,7 @@ const Index = () => {
             toast({
               title: "Uploading the full video",
               description:
-                "Audio extraction failed in this browser, and the video is large — the upload may time out.",
+                "Audio extraction failed in this browser, and the video is large. The upload may time out.",
             });
           }
         }
@@ -238,7 +262,7 @@ const Index = () => {
       } else {
         toast({
           title: "Processing already in progress",
-          description: "This video is being processed — attaching to the running job.",
+          description: "This video is being processed. Attaching to the running job.",
         });
       }
 
@@ -315,31 +339,162 @@ const Index = () => {
     setTheme(theme === "dark" ? "light" : "dark");
   };
 
+  const toggleMirror = () => {
+    setMirrored((value) => {
+      localStorage.setItem("deeprecall-mirror", value ? "0" : "1");
+      return !value;
+    });
+  };
+
+  const videoSrc =
+    playerSource && playerSource.kind !== "youtube"
+      ? playerSource.kind === "url" && playback === "proxy"
+        ? mediaProxyUrl(playerSource.src)
+        : playerSource.src
+      : null;
+
+  const handleVideoError = () => {
+    if (playerSource?.kind === "url" && playback === "direct") {
+      setPlayback("proxy");
+    } else {
+      setPlayback("failed");
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-purple-700 via-purple-600 to-purple-800 dark:from-purple-900 dark:via-purple-800 dark:to-purple-950 p-3 sm:p-6">
-      <div className="max-w-7xl mx-auto">
-        <div className="flex justify-between items-center mb-4 sm:mb-8">
-          <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-white">
-            DeepRecall
-          </h1>
+    <div className="min-h-screen md:h-dvh md:min-h-0 md:overflow-y-auto flex flex-col bg-gradient-to-br from-purple-700 via-purple-600 to-purple-800 dark:from-purple-900 dark:via-purple-800 dark:to-purple-950 p-3">
+      <div className="w-full max-w-7xl mx-auto flex flex-col md:flex-1 md:min-h-0">
+        <div className="shrink-0 flex justify-between items-center mb-3">
+          <div className="flex items-center gap-2.5">
+            <BrandMark className="h-10 w-10 text-white" />
+            <h1 className="text-2xl font-bold text-white">DeepRecall</h1>
+          </div>
           <div className="flex items-center gap-2">
-            <SettingsPopover onSaved={refreshHealth} />
-            <Button 
-              variant="outline" 
-              size="icon" 
-              onClick={toggleTheme} 
-              className="rounded-full bg-white/10 hover:bg-white/20 text-white"
-            >
-              {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
-            </Button>
+            <Tooltip delayDuration={50}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={toggleMirror}
+                  className="hidden md:inline-flex rounded-full border-white/40 bg-white/10 hover:bg-white/30 text-white hover:text-white dark:border-white/20 dark:bg-black dark:hover:bg-gray-700"
+                >
+                  <FlipHorizontal2 className="h-5 w-5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Swap the content and tool columns</TooltipContent>
+            </Tooltip>
+            <Tooltip delayDuration={50}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={toggleTheme}
+                  className="rounded-full border-white/40 bg-white/10 hover:bg-white/30 text-white hover:text-white dark:border-white/20 dark:bg-black dark:hover:bg-gray-700"
+                >
+                  {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+              </TooltipContent>
+            </Tooltip>
           </div>
         </div>
-        
-        {/* On phones the wrappers dissolve (max-md:contents) and the cards
-            reorder into: upload, player, transcript, summary, search, highlights. */}
-        <div className="grid grid-cols-1 md:grid-cols-7 gap-4 md:gap-6">
-          <div className="max-md:contents md:col-span-3 md:space-y-6">
-            <div className="max-md:order-1">
+
+        {/* Desktop is viewport-fit: the page never scrolls, panels scroll inside
+            themselves. On phones the wrappers dissolve (max-md:contents) and the
+            cards reorder into: upload, player, results, search, highlights. */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-3 md:flex-1 md:min-h-[430px]">
+          <div
+            className={`max-md:contents md:col-span-7 lg:col-span-8 md:flex md:flex-col md:gap-3 md:min-h-0 ${
+              mirrored ? "md:order-2" : "md:order-1"
+            }`}
+          >
+            {playerSource && (
+              <div
+                className={`md:shrink-0 max-md:order-2 ${
+                  videoHidden ? "" : "max-md:sticky max-md:top-2 max-md:z-30"
+                }`}
+              >
+                <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
+                  <CardHeader className={videoHidden ? "p-3" : "p-3 pb-3"}>
+                    <div className="flex items-center justify-between gap-2">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <CardTitle className="text-lg flex items-center gap-2 cursor-help">
+                            <PlayCircle className="h-5 w-5" /> Video Player
+                          </CardTitle>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          Watch the video. Transcript timestamps and search results jump
+                          playback here.
+                        </TooltipContent>
+                      </Tooltip>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setVideoHidden((value) => !value)}
+                        className="h-7 gap-1.5 px-2 text-gray-600 dark:text-gray-300"
+                      >
+                        {videoHidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+                        {videoHidden ? "Show video" : "Hide video"}
+                      </Button>
+                    </div>
+                  </CardHeader>
+                  {/* Hidden via display, not unmount: audio, timeupdate and
+                      seeking keep working while the video is out of the way. */}
+                  <CardContent className={`p-3 pt-0 ${videoHidden ? "hidden" : ""}`}>
+                    <div>
+                      {playerSource.kind === "youtube" ? (
+                        <div className="mx-auto w-full md:max-w-[80vh]">
+                          <YouTubePlayer
+                            ref={youtubeRef}
+                            videoId={playerSource.id}
+                            onTime={setCurrentTime}
+                          />
+                        </div>
+                      ) : playback === "failed" ? (
+                        <div className="flex min-h-[100px] items-center justify-center rounded-md border border-dashed border-gray-300 p-4 dark:border-gray-600">
+                          <p className="text-center text-sm text-gray-500 dark:text-gray-400">
+                            This source can't be played in the browser. Transcript,
+                            summaries and search still work.
+                          </p>
+                        </div>
+                      ) : (
+                        <video
+                          key={videoSrc ?? "video"}
+                          ref={videoRef}
+                          src={videoSrc ?? undefined}
+                          controls
+                          playsInline
+                          onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+                          onError={handleVideoError}
+                          className="w-full rounded-md bg-black object-contain max-h-[40vh] md:max-h-[45vh]"
+                        />
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            )}
+            <div className="max-md:order-3 md:flex-1 md:min-h-0">
+              <ResultsPanel
+                transcript={transcript}
+                summary={summary}
+                currentTime={currentTime}
+                onSeek={seekTo}
+                onRegenerate={handleRegenerate}
+                regenerating={regenerating}
+              />
+            </div>
+          </div>
+
+          <div
+            className={`max-md:contents md:col-span-5 lg:col-span-4 md:flex md:flex-col md:gap-3 md:min-h-0 ${
+              mirrored ? "md:order-1" : "md:order-2"
+            }`}
+          >
+            <div className="max-md:order-1 md:shrink-0">
               <UploadPanel
                 video={video}
                 health={health}
@@ -354,7 +509,7 @@ const Index = () => {
                 onRetryHealth={refreshHealth}
               />
             </div>
-            <div className="max-md:order-5">
+            <div className="max-md:order-5 md:flex-[2] md:min-h-0">
               <SearchPanel
                 key={`search-${videoHash}`}
                 videoHash={videoHash}
@@ -362,53 +517,11 @@ const Index = () => {
                 onSeek={seekTo}
               />
             </div>
-            <div className="max-md:order-6">
+            <div className="max-md:order-6 md:flex-[1] md:min-h-0">
               <HighlightsPanel
                 key={`highlights-${videoHash}`}
                 transcript={transcript}
                 onSeek={seekTo}
-              />
-            </div>
-          </div>
-
-          <div className="max-md:contents md:col-span-4 md:space-y-6">
-            {playerSource && (
-              <div className="max-md:order-2 max-md:sticky max-md:top-2 max-md:z-30">
-                <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
-                  <CardContent className="p-2 sm:p-3">
-                    {playerSource.kind === "youtube" ? (
-                      <YouTubePlayer
-                        ref={youtubeRef}
-                        videoId={playerSource.id}
-                        onTime={setCurrentTime}
-                      />
-                    ) : (
-                      <video
-                        ref={videoRef}
-                        src={playerSource.src}
-                        controls
-                        playsInline
-                        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-                        className="w-full rounded-md bg-black max-h-[40vh] md:max-h-none"
-                      />
-                    )}
-                  </CardContent>
-                </Card>
-              </div>
-            )}
-            <div className="max-md:order-3">
-              <TranscriptPanel
-                transcript={transcript}
-                currentTime={currentTime}
-                onSeek={seekTo}
-              />
-            </div>
-            <div className="max-md:order-4">
-              <SummaryPanel
-                summary={summary}
-                onSeek={seekTo}
-                onRegenerate={handleRegenerate}
-                regenerating={regenerating}
               />
             </div>
           </div>

@@ -95,7 +95,17 @@
     @apply border-border;
   }
 
+  /* Match the app gradient so rubber-band overscroll never flashes white. */
+  html {
+    background-color: #7e22ce; /* purple-700 */
+  }
+
+  html.dark {
+    background-color: #3b0764; /* purple-950 */
+  }
+
   body {
-    @apply bg-background text-foreground;
+    @apply text-foreground;
+    background-color: transparent;
   }
 }

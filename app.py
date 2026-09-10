@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 import openai
 import os
@@ -143,9 +143,24 @@ MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))  # 3 hour
 # correct here for the same reason as the job registry: gunicorn --workers 1.
 # ---------------------------------------------------------------------------
 
-RATE_LIMIT_JOBS_PER_HOUR = int(os.getenv("RATE_LIMIT_JOBS_PER_HOUR", "10"))  # 0 disables
-RATE_LIMIT_JOBS_PER_DAY = int(os.getenv("RATE_LIMIT_JOBS_PER_DAY", "20"))    # 0 disables
-_rate_buckets = {}
+RATE_LIMIT_JOBS_PER_HOUR = int(os.getenv("RATE_LIMIT_JOBS_PER_HOUR", "6"))   # 0 disables
+RATE_LIMIT_JOBS_PER_DAY = int(os.getenv("RATE_LIMIT_JOBS_PER_DAY", "12"))    # 0 disables
+# A resummarize is a single gpt-4.1-nano call — roughly 30x cheaper than a
+# full analysis (which is transcription-dominated) — so it gets its own,
+# 2x larger allowance instead of competing with processing for slots.
+RATE_LIMIT_SUMMARIES_PER_HOUR = int(
+    os.getenv("RATE_LIMIT_SUMMARIES_PER_HOUR", str(2 * RATE_LIMIT_JOBS_PER_HOUR))
+)
+RATE_LIMIT_SUMMARIES_PER_DAY = int(
+    os.getenv("RATE_LIMIT_SUMMARIES_PER_DAY", str(2 * RATE_LIMIT_JOBS_PER_DAY))
+)
+# kind -> (per-hour limit, per-day limit, noun for the 429 message)
+_RATE_LIMITS = {
+    "analysis": (RATE_LIMIT_JOBS_PER_HOUR, RATE_LIMIT_JOBS_PER_DAY, "analyses"),
+    "summary": (RATE_LIMIT_SUMMARIES_PER_HOUR, RATE_LIMIT_SUMMARIES_PER_DAY,
+                "summary regenerations"),
+}
+_rate_buckets = {}  # (kind, ip) -> deque of claim timestamps
 _rate_lock = threading.Lock()
 
 
@@ -156,27 +171,29 @@ def _client_ip():
     return request.remote_addr or "unknown"
 
 
-def _claim_job_slot(ip):
-    """Take one analysis slot for this IP against both windows (burst 10/hour,
-    cap 20/day by default). Returns (True, 0, None) when granted, else
+def _claim_job_slot(ip, kind="analysis"):
+    """Take one slot of the given kind for this IP against both windows
+    (analyses: 6/hour, 12/day; summaries: 2x that, by default). Returns
+    (True, 0, None) when granted, else
     (False, seconds_until_a_slot_frees, "hour"|"day")."""
-    if RATE_LIMIT_JOBS_PER_HOUR <= 0 and RATE_LIMIT_JOBS_PER_DAY <= 0:
+    per_hour, per_day, _ = _RATE_LIMITS[kind]
+    if per_hour <= 0 and per_day <= 0:
         return True, 0, None
     now = time.time()
     with _rate_lock:
-        bucket = _rate_buckets.setdefault(ip, deque())
+        bucket = _rate_buckets.setdefault((kind, ip), deque())
         while bucket and now - bucket[0] > 86400:
             bucket.popleft()
         for stale in [key for key, entries in _rate_buckets.items() if not entries]:
-            if stale != ip:
+            if stale != (kind, ip):
                 del _rate_buckets[stale]
 
         retry_after, scope = 0, None
         hour_hits = [t for t in bucket if now - t <= 3600]
-        if RATE_LIMIT_JOBS_PER_HOUR > 0 and len(hour_hits) >= RATE_LIMIT_JOBS_PER_HOUR:
+        if per_hour > 0 and len(hour_hits) >= per_hour:
             retry_after = int(hour_hits[0] + 3600 - now) + 1
             scope = "hour"
-        if RATE_LIMIT_JOBS_PER_DAY > 0 and len(bucket) >= RATE_LIMIT_JOBS_PER_DAY:
+        if per_day > 0 and len(bucket) >= per_day:
             day_wait = int(bucket[0] + 86400 - now) + 1
             if day_wait > retry_after:
                 retry_after, scope = day_wait, "day"
@@ -187,12 +204,23 @@ def _claim_job_slot(ip):
         return True, 0, None
 
 
-def _release_job_slot(ip):
-    """Give back a slot when no new analysis actually started (dedupe/error)."""
+def _release_job_slot(ip, kind="analysis"):
+    """Give back a slot when no new work actually started (dedupe/error)."""
     with _rate_lock:
-        bucket = _rate_buckets.get(ip)
+        bucket = _rate_buckets.get((kind, ip))
         if bucket:
             bucket.pop()
+
+
+def _fully_cached(video_key):
+    """True when every pipeline stage would be a cache hit, i.e. re-processing
+    this video spends no model money and should not count against the limit."""
+    return bool(
+        cache.get(f"transcript:{video_key}")
+        and cache.get(f"summary:{video_key}")
+        and cache.exists(f"search:{video_key}")
+        and cache.exists(f"searchvec:{video_key}")
+    )
 
 
 def _fmt_wait(seconds):
@@ -204,11 +232,12 @@ def _fmt_wait(seconds):
     return f"about {hours} hour" + ("s" if hours > 1 else "")
 
 
-def _rate_limited_response(retry_after, scope):
-    limit = RATE_LIMIT_JOBS_PER_HOUR if scope == "hour" else RATE_LIMIT_JOBS_PER_DAY
+def _rate_limited_response(retry_after, scope, kind="analysis"):
+    per_hour, per_day, noun = _RATE_LIMITS[kind]
+    limit = per_hour if scope == "hour" else per_day
     per = "per hour" if scope == "hour" else "per day"
     response = jsonify({
-        "error": f"Rate limit reached ({limit} analyses {per}). "
+        "error": f"Rate limit reached ({limit} {noun} {per}). "
                  f"Try again in {_fmt_wait(retry_after)}.",
         "retry_after": retry_after,
     })
@@ -288,13 +317,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
             urlsha_raw = cache.get(f"urlsha:{url_key}")
             if urlsha_raw:
                 known_sha = urlsha_raw.decode() if isinstance(urlsha_raw, bytes) else str(urlsha_raw)
-                known_key = f"{known_sha}:{backend}"
-                if (
-                    cache.get(f"transcript:{known_key}")
-                    and cache.get(f"summary:{known_key}")
-                    and cache.exists(f"search:{known_key}")
-                    and cache.exists(f"searchvec:{known_key}")
-                ):
+                if _fully_cached(f"{known_sha}:{backend}"):
                     sha256 = known_sha
 
             if sha256 is None:
@@ -325,7 +348,7 @@ def run_pipeline(job_id, video_key, backend, upload_path, workdir, source_url=No
             duration = _probe_duration(audio_path)
             if duration and duration > MAX_DURATION_SECONDS:
                 raise RuntimeError(
-                    f"Video is longer than {MAX_DURATION_SECONDS // 3600} hours — not supported."
+                    f"Video is longer than {MAX_DURATION_SECONDS // 3600} hours, not supported."
                 )
 
             _update_job(job_id, stage="transcribing", message="Transcribing")
@@ -502,7 +525,7 @@ def _download_direct(url, workdir, progress=None):
     with opener.open(request_, timeout=60) as resp:
         if "text/html" in (resp.headers.get("Content-Type") or ""):
             raise RuntimeError(
-                "That link returns a web page, not a video file — use a direct file link."
+                "That link returns a web page, not a video file. Use a direct file link."
             )
         total = int(resp.headers.get("Content-Length") or 0)
         if total and total > limit:
@@ -529,11 +552,74 @@ def _download_source(url, workdir, progress=None):
             message = str(e)
             if "Sign in" in message or "bot" in message.lower():
                 raise RuntimeError(
-                    "YouTube blocked the server's request — try a direct file "
+                    "YouTube blocked the server's request. Try a direct file "
                     "link or upload the file instead."
                 )
             raise RuntimeError(f"Could not download from that link: {message[:200]}")
     return _download_direct(url, workdir, progress)
+
+
+_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+    ".mkv": "video/x-matroska",
+}
+# Each proxied stream pins one gunicorn gthread (of 8) for its lifetime.
+_MEDIA_STREAMS = threading.BoundedSemaphore(int(os.getenv("MEDIA_PROXY_STREAMS", "3")))
+
+
+@app.route("/media/by-url")
+def media_by_url():
+    """Streaming proxy for direct-link videos whose origin refuses inline
+    playback (octet-stream + nosniff + attachment, e.g. GitHub release
+    assets). Storage-free: bytes are piped through with a real video
+    content-type, and Range passthrough keeps seeking alive. Only URLs that
+    were actually processed here are served, so this is not an open proxy."""
+    url = (request.args.get("url") or "").strip()
+    if not url.lower().startswith(("http://", "https://")) or len(url) > 2000:
+        return jsonify({"error": "Provide an http(s) URL."}), 400
+    url_sha = hashlib.sha256(url.encode()).hexdigest()
+    if not any(cache.get(f"urlsha:url:{url_sha}:{b}") for b in AVAILABLE_BACKENDS):
+        return jsonify({"error": "Unknown media URL. Process it first."}), 404
+    try:
+        _assert_public_host(url)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+    if not _MEDIA_STREAMS.acquire(blocking=False):
+        return jsonify({"error": "Too many concurrent streams. Try again shortly."}), 503
+    try:
+        headers = {"User-Agent": "DeepRecall/1.0"}
+        if request.headers.get("Range"):
+            headers["Range"] = request.headers["Range"]
+        opener = urllib.request.build_opener(_SafeRedirectHandler())
+        upstream = opener.open(urllib.request.Request(url, headers=headers), timeout=30)
+    except Exception as e:
+        _MEDIA_STREAMS.release()
+        return jsonify({"error": f"Could not fetch that URL: {e}"}), 502
+
+    def generate():
+        try:
+            while chunk := upstream.read(64 * 1024):
+                yield chunk
+        finally:
+            upstream.close()
+            _MEDIA_STREAMS.release()
+
+    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    resp = Response(
+        generate(),
+        status=getattr(upstream, "status", 200),
+        mimetype=_MEDIA_TYPES.get(ext, "video/mp4"),
+    )
+    resp.headers["Content-Disposition"] = "inline"
+    resp.headers["Accept-Ranges"] = upstream.headers.get("Accept-Ranges", "bytes")
+    for name in ("Content-Length", "Content-Range"):
+        if upstream.headers.get(name):
+            resp.headers[name] = upstream.headers[name]
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
 
 
 def _sweep_stale_workdirs():
@@ -742,9 +828,10 @@ def _fmt_ts(seconds):
 
 def summarize_text(transcript):
     """Generates a short and a detailed summary, running API calls in parallel.
-    gpt-4.1-nano's 1M-token context takes any real lecture in a single pass.
-    The transcript is fed as [mm:ss]-stamped lines so the detailed summary can
-    cite timestamps in its Key moments section."""
+    gpt-4.1-nano's 1M-token context takes any real lecture in a single pass, so
+    the transcript (already joined from the transcription chunks with correct
+    timestamp offsets) is fed whole as [mm:ss]-stamped lines. Structure scales
+    with video length: the section budget grows with duration."""
     stamped = "\n".join(
         f"[{_fmt_ts(seg['start'])}] {seg['text'].strip()}" for seg in transcript
     )
@@ -752,23 +839,34 @@ def summarize_text(transcript):
     if n_tokens > 800000:
         raise RuntimeError(f"Transcript too long to summarize ({n_tokens} tokens).")
 
+    duration = transcript[-1]["end"] if transcript else 0
+    # Roughly one major section per 7 minutes, clamped to a readable 3..12.
+    target_sections = max(3, min(12, round(duration / 420)))
+
+    detailed_prompt = (
+        "You are summarizing a lecture or video transcript. Each transcript line is "
+        "prefixed with its [mm:ss] start timestamp. Produce a structured Markdown "
+        "summary with exactly this shape:\n"
+        "1. A short overview paragraph, 2 to 3 sentences, with no timestamps.\n"
+        f"2. About {target_sections} numbered sections that cover the whole video in "
+        "order. Format every section heading as '## 1. Topic title [mm:ss]' where the "
+        "timestamp is copied from the transcript line where that topic starts. Never "
+        "invent timestamps, only copy stamps that appear in the transcript.\n"
+        "3. Under each heading, 2 to 5 concise bullet points with the key points of "
+        "that section. Do not put timestamps on bullets; at most one inline [mm:ss] "
+        "stamp inside a bullet for a truly pivotal moment.\n"
+        "Use timestamps sparingly overall: section headings carry them, everything "
+        "else stays clean. Write with plain hyphens and commas; do not use em dashes."
+    )
+    short_prompt = (
+        "Provide a very brief high-level summary of the following lecture in under "
+        "300 words of plain prose. Ignore the [mm:ss] timestamps and do not include "
+        "any. Do not use em dashes."
+    )
+
     with ThreadPoolExecutor(max_workers=2) as pool:
-        detailed_future = pool.submit(
-            _chat,
-            "Create a structured, detailed summary in Markdown of the following lecture "
-            "transcript. Each line is prefixed with its [mm:ss] timestamp. Organize the "
-            "key points into sections with '##' headings, using bullet points where "
-            "helpful, and finish with a '## Key moments' section listing the most "
-            "important moments as '- [mm:ss] description' with timestamps taken from "
-            "the transcript.",
-            stamped,
-        )
-        short_future = pool.submit(
-            _chat,
-            "Provide a very brief high-level summary of the following lecture in under "
-            "300 words of plain prose. Ignore the [mm:ss] timestamps.",
-            stamped,
-        )
+        detailed_future = pool.submit(_chat, detailed_prompt, stamped)
+        short_future = pool.submit(_chat, short_prompt, stamped)
         return short_future.result(), detailed_future.result()
 
 
@@ -914,8 +1012,10 @@ def process_video():
         video_key = f"{sha256}:{backend}"
 
         job_id, deduplicated = start_job(video_key, backend, upload_path, workdir)
-        if deduplicated:
-            _release_job_slot(ip)  # attached to a running job; no new spend
+        if deduplicated or _fully_cached(video_key):
+            # Attached to a running job, or every stage is a cache hit:
+            # no model money is spent, so give the slot back.
+            _release_job_slot(ip)
         return jsonify({
             "job_id": job_id,
             "video_hash": video_key,
@@ -952,8 +1052,16 @@ def process_url():
     workdir = tempfile.mkdtemp(prefix="deeprecall-")
     try:
         job_id, deduplicated = start_url_job(url, backend, workdir)
-        if deduplicated:
-            _release_job_slot(ip)  # attached to a running job; no new spend
+        # A URL seen before whose results are all still cached re-runs for
+        # free (the pipeline skips the download and hits every cache), so it
+        # should not count against the limit either.
+        url_sha = hashlib.sha256(url.encode()).hexdigest()
+        known_raw = cache.get(f"urlsha:url:{url_sha}:{backend}")
+        known_sha = (
+            known_raw.decode() if isinstance(known_raw, bytes) else known_raw
+        ) if known_raw else None
+        if deduplicated or (known_sha and _fully_cached(f"{known_sha}:{backend}")):
+            _release_job_slot(ip)
         return jsonify({"job_id": job_id, "deduplicated": deduplicated}), 202
     except Exception as e:
         _release_job_slot(ip)
@@ -964,20 +1072,21 @@ def process_url():
 
 @app.route('/resummarize', methods=['POST'])
 def resummarize():
-    """Regenerates the summary for an already-transcribed video. Costs a model
-    call, so it shares the per-IP analysis rate limit."""
+    """Regenerates the summary for an already-transcribed video. A single
+    model call — much cheaper than an analysis — so it draws from its own,
+    larger per-IP rate limit."""
     data = request.json or {}
     video_key = data.get("video_hash", "")
     if not video_key:
         return jsonify({"error": "video_hash is required."}), 400
     transcript_raw = cache.get(f"transcript:{video_key}")
     if not transcript_raw:
-        return jsonify({"error": "Transcript expired — re-process the video first."}), 404
+        return jsonify({"error": "Transcript expired. Re-process the video first."}), 404
 
     ip = _client_ip()
-    allowed, retry_after, scope = _claim_job_slot(ip)
+    allowed, retry_after, scope = _claim_job_slot(ip, "summary")
     if not allowed:
-        return _rate_limited_response(retry_after, scope)
+        return _rate_limited_response(retry_after, scope, "summary")
     try:
         transcript = json.loads(transcript_raw)
         short_summary, detailed_summary = summarize_text(transcript)
@@ -985,7 +1094,7 @@ def resummarize():
         cache.setex(f"summary:{video_key}", CACHE_TTL, json.dumps(summary))
         return jsonify({"summary": summary})
     except Exception as e:
-        _release_job_slot(ip)
+        _release_job_slot(ip, "summary")
         print(f"❌ Error regenerating summary: {e}")
         return jsonify({"error": f"Failed to regenerate summary: {e}"}), 500
 
@@ -1100,7 +1209,7 @@ def health():
 
 @app.route("/")
 def hello_world():
-    return f"<h1>DeepRecall API — transcription backend: {DEFAULT_BACKEND}</h1>"
+    return f"<h1>DeepRecall API. Transcription backend: {DEFAULT_BACKEND}</h1>"
 
 
 if __name__ == '__main__':

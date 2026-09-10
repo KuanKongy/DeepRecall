@@ -45,54 +45,57 @@ const SearchPanel = ({ videoHash, enabled, onSeek }: SearchPanelProps) => {
   };
 
   return (
-    <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
-      <CardHeader className="pb-2">
+    <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90 h-full flex flex-col">
+      <CardHeader className="p-3">
         <Tooltip>
           <TooltipTrigger asChild>
-            <CardTitle className="text-xl flex items-center gap-2 cursor-help">
-              <Search className="h-5 w-5" /> Transcript Search
+            <CardTitle className="text-lg flex items-center gap-2 cursor-help">
+              <Search className="h-5 w-5" /> Semantic Search
             </CardTitle>
           </TooltipTrigger>
           <TooltipContent className="max-w-xs">
-            Semantic search over the transcript — finds moments by meaning, not just exact words.
+            Semantic search over the transcript. Finds moments by meaning, not just exact words.
           </TooltipContent>
         </Tooltip>
       </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
-          <Input
-            placeholder="Search in video transcript..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && enabled && !busy) handleSearch();
-            }}
-            disabled={!enabled}
-          />
-          <Button
-            onClick={handleSearch}
-            disabled={!enabled || busy}
-            className="w-full bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
-          >
-            {busy ? "Searching..." : "Search Transcript"}
-          </Button>
+      <CardContent className="p-3 pt-0 flex-1 min-h-0 flex flex-col">
+        <div className="flex flex-1 min-h-0 flex-col gap-3">
+          <div className="flex gap-2">
+            <Input
+              className="h-9"
+              placeholder="Search in video transcript..."
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && enabled && !busy) handleSearch();
+              }}
+              disabled={!enabled}
+            />
+            <Button
+              onClick={handleSearch}
+              disabled={!enabled || busy}
+              className="h-9 shrink-0 bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
+            >
+              {busy ? "Searching..." : "Search"}
+            </Button>
+          </div>
           {!enabled ? (
-            <div className="border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
+            <div className="flex flex-1 items-center justify-center border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
               <p className="text-gray-500 dark:text-gray-400 text-center">
                 Upload and process a video first to enable search
               </p>
             </div>
           ) : hits.length > 0 ? (
-            <div className="border rounded-md p-3 bg-gray-50 dark:bg-gray-700 max-h-[240px] overflow-y-auto space-y-2">
+            <div className="border rounded-md p-3 bg-gray-50 dark:bg-gray-700 max-h-[240px] md:max-h-none md:flex-1 md:min-h-0 overflow-y-auto space-y-2">
               {hits.map((hit, index) => (
                 <button
                   key={index}
                   type="button"
                   onClick={() => hit.start !== null && onSeek(hit.start)}
-                  className="block w-full text-left rounded-md p-2 hover:bg-purple-50 dark:hover:bg-gray-600"
+                  className="block w-full text-left rounded-md p-2 hover:bg-violet-50 dark:hover:bg-gray-600"
                 >
                   {hit.start !== null && (
-                    <span className="text-sm font-medium text-purple-600 dark:text-purple-400 mr-2">
+                    <span className="text-sm font-medium text-violet-600 dark:text-violet-400 mr-2">
                       {fmtTime(hit.start)}
                     </span>
                   )}
@@ -101,7 +104,7 @@ const SearchPanel = ({ videoHash, enabled, onSeek }: SearchPanelProps) => {
               ))}
             </div>
           ) : (
-            <div className="border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
+            <div className="flex flex-1 items-center justify-center border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
               <p className="text-gray-500 dark:text-gray-400 text-center">
                 Enter a search term and click Search
               </p>

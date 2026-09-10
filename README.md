@@ -32,7 +32,7 @@ Copy `.env.sample` to `.env` and fill in:
 | `REDIS_URL` | Optional; `rediss://…` from Upstash. Unset = memory cache |
 | `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY` | Per-IP analyses (defaults 10/hour, 20/day; 0 disables) |
 | `MAX_DURATION_SECONDS` | Longest accepted video (default 10800 = 3 h) |
-| `CORS_ORIGINS` | Comma-separated origin allowlist |
+| `CORS_ORIGINS` | Comma-separated origin allowlist (include the custom Pages domain) |
 
 `GET /health` reports the active cache and which backends are available.
 
@@ -55,8 +55,7 @@ TRANSCRIBE_BACKEND=mlx python app.py
 ```
 
 The first run downloads ~1.6 GB of Whisper weights to `~/.cache/huggingface`.
-The hosted UI can also target a Mac backend: set the server URL to
-`http://localhost:10000` in the UI settings.
+Use the local UI against it: `cd frontend && npm run dev`.
 The quickest Mac GPU setup is the helper script, which creates `.venv`,
 installs both requirements files, loads `.env`, and starts the backend in MLX
 mode with the in-memory cache:
@@ -70,8 +69,10 @@ mode with the in-memory cache:
 - **API**: Railway builds the root `Dockerfile` on push (`railway.toml` sets the
   `/health` healthcheck). Set the variables above in the Railway service, plus
   `REDIS_URL` from an Upstash Redis database in the same region.
-- **Frontend**: `cd frontend && npm run deploy` publishes to GitHub Pages.
-  `frontend/.env.production` holds the Railway domain.
+- **Frontend**: pushed changes under `frontend/` deploy to GitHub Pages
+  automatically via GitHub Actions (`.github/workflows/deploy-pages.yml`).
+  The API URL comes from `frontend/.env.production`, or from a repo Actions
+  variable `VITE_API_URL` if set.
 
 ## Local Docker (everything in one command)
 

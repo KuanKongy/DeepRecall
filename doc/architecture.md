@@ -28,11 +28,8 @@ The browser does the heavy lifting before a byte is uploaded:
    transcribing k/n → summarizing → indexing.
 
 The backend dropdown is built from `GET /health` (`available_backends`) and
-hidden when only one backend exists. A settings popover stores a server URL
-in `localStorage`, applied per request through an axios interceptor — the
-hosted page can target a backend on your own machine at
-`http://localhost:10000` (localhost is exempt from mixed-content blocking in
-Chrome/Firefox).
+hidden when only one backend exists. The API base URL is baked in at build
+time (`VITE_API_URL`) — it's a public value, not a secret.
 
 ## Processing from a URL
 
@@ -50,6 +47,26 @@ the IFrame API); note YouTube may bot-block datacenter IPs, so that path is
 best-effort in production and reliable in local mode. The UI's "Try a demo"
 button feeds a sample lecture hosted as a GitHub Release asset through this
 same path.
+
+### Playback of URL sources
+
+The server never stores media, so the player points the `<video>` element at
+the original URL. Many file hosts (GitHub Releases included) serve videos as
+`application/octet-stream` with `nosniff` and `Content-Disposition:
+attachment`, which browsers refuse to play inline — the element stalls or
+errors while transcription (done server-side) works fine. `GET
+/media/by-url?url=…` fixes this: a storage-free streaming proxy that re-emits
+the bytes with a real video content-type, `inline` disposition, and Range
+passthrough so seeking works. It reuses the download path's SSRF guard, only
+serves URLs whose `urlsha` cache entry proves they were processed here (so it
+is not an open proxy, and access expires with the 24 h cache), and caps
+concurrent streams (`MEDIA_PROXY_STREAMS`, default 3) because each stream
+pins one gunicorn thread. The frontend tries the original URL first and
+switches to the proxy on a media error or when no data has arrived shortly
+after mount (some hosts stall forever without firing an error); if the proxy
+also fails it shows a "can't be played in the browser" note in the player
+slot. yt-dlp-fetched sources (Drive etc.) are audio-only server-side and land
+on that note by design; YouTube keeps the iframe player.
 
 ## Server-side job pipeline
 
@@ -126,15 +143,22 @@ API one. `GET /health` reports the cache mode and a live Redis ping.
 
 The app is open — no accounts, no password. Spend is bounded instead:
 
-- A per-IP rate limit — a burst window and a daily cap (defaults 10
-  analyses/hour and 20/day, `RATE_LIMIT_JOBS_PER_HOUR` /
-  `RATE_LIMIT_JOBS_PER_DAY`) — on the endpoints that cost model money:
-  `/process_video`, `/process_url` and `/resummarize`. A 429 carries
-  `retry_after` seconds and a Retry-After header, and the UI tells the user
-  how long to wait. Attaching to an already-running job for the same video
-  doesn't consume a slot; searches and polling are unlimited. In-memory,
-  which is correct under the single-worker deployment; the client IP comes
-  from `X-Forwarded-For` behind the platform proxy.
+- A per-IP rate limit — a burst window and a daily cap — on the endpoints
+  that cost model money, with two separate buckets: analyses (defaults 6/hour
+  and 12/day, `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY`) cover
+  `/process_video` and `/process_url`, while `/resummarize` draws from its own
+  2x-larger allowance (defaults 12/hour and 24/day,
+  `RATE_LIMIT_SUMMARIES_PER_HOUR` / `RATE_LIMIT_SUMMARIES_PER_DAY`) — a
+  regeneration is a single gpt-4.1-nano call, ~30x cheaper than a
+  transcription-dominated analysis, so analyses remain ~95% of worst-case
+  spend. Only requests that actually spend model money consume a slot:
+  attaching to an already-running job or re-processing a video whose
+  transcript, summary and search index are all still cached releases the
+  slot. A 429 carries `retry_after` seconds and a Retry-After header, and
+  the UI tells the user how long to wait; searches and polling are
+  unlimited. In-memory, which is correct under the single-worker
+  deployment; the client IP comes from `X-Forwarded-For` behind the
+  platform proxy.
 - Videos longer than `MAX_DURATION_SECONDS` (default 3 h) are rejected after
   audio extraction, and yt-dlp filters them out before downloading.
 - `MAX_CONTENT_LENGTH` (default 2 GB) turns oversized uploads into a 413

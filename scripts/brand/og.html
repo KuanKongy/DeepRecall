@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; padding: 0; }
+      body {
+        position: relative;
+        width: 1200px;
+        height: 630px;
+        background: linear-gradient(135deg, #9333ea 0%, #7e22ce 55%, #6b21a8 100%);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        overflow: hidden;
+      }
+      .content {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 84px;
+        height: 100%;
+        padding-bottom: 40px;
+        box-sizing: border-box;
+      }
+      .mark { width: 340px; height: 340px; filter: drop-shadow(0 16px 40px rgba(30, 6, 66, 0.5)); }
+      h1 {
+        margin: 0;
+        color: #fff;
+        font-size: 104px;
+        font-weight: 800;
+        letter-spacing: -3px;
+      }
+      .tagline {
+        margin: 14px 0 0 4px;
+        color: rgba(255, 255, 255, 0.88);
+        font-size: 33px;
+        font-weight: 500;
+      }
+      .chips { display: flex; gap: 14px; margin: 30px 0 0 4px; }
+      .chip {
+        padding: 10px 22px;
+        border: 2px solid rgba(255, 255, 255, 0.45);
+        border-radius: 999px;
+        color: #fff;
+        font-size: 24px;
+        font-weight: 600;
+        background: rgba(255, 255, 255, 0.10);
+      }
+      .wave {
+        position: absolute;
+        left: 0; right: 0; bottom: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        height: 90px;
+      }
+      .wave div { width: 10px; border-radius: 5px; background: rgba(255, 255, 255, 0.16); }
+      .url {
+        position: absolute;
+        right: 36px; bottom: 26px;
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 20px;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wave" id="wave"></div>
+    <div class="content">
+      <img class="mark" src="../../frontend/public/mark.svg" alt="" />
+      <div>
+        <h1>DeepRecall</h1>
+        <p class="tagline">Turn videos into searchable knowledge</p>
+        <div class="chips">
+          <span class="chip">Transcribe</span>
+          <span class="chip">Summarize</span>
+          <span class="chip">Search by meaning</span>
+        </div>
+      </div>
+    </div>
+    <script>
+      const wave = document.getElementById("wave");
+      const heights = [18, 30, 46, 64, 40, 24, 52, 78, 58, 34, 20, 44, 66, 88, 60, 38, 26, 48, 70, 50,
+                       30, 18, 40, 62, 84, 56, 36, 22, 46, 68, 90, 64, 42, 28, 50, 72, 54, 32, 20, 44,
+                       60, 80, 52, 34, 24, 42, 58, 38, 26, 18];
+      for (const h of heights) {
+        const bar = document.createElement("div");
+        bar.style.height = h + "px";
+        wave.appendChild(bar);
+      }
+    </script>
+  </body>
+</html>

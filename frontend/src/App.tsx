@@ -13,7 +13,7 @@ const queryClient = new QueryClient();
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <ThemeProvider defaultTheme="light">
-      <TooltipProvider>
+      <TooltipProvider delayDuration={200}>
         <Toaster />
         <Sonner />
         <BrowserRouter basename={import.meta.env.BASE_URL}>

@@ -63,11 +63,11 @@ const HighlightsPanel = ({ transcript, onSeek }: HighlightsPanelProps) => {
   };
 
   return (
-    <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
-      <CardHeader className="pb-2">
+    <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90 h-full flex flex-col">
+      <CardHeader className="p-3">
         <Tooltip>
           <TooltipTrigger asChild>
-            <CardTitle className="text-xl flex items-center gap-2 cursor-help">
+            <CardTitle className="text-lg flex items-center gap-2 cursor-help">
               <ListFilter className="h-5 w-5" /> Keyword Highlights
             </CardTitle>
           </TooltipTrigger>
@@ -76,37 +76,43 @@ const HighlightsPanel = ({ transcript, onSeek }: HighlightsPanelProps) => {
           </TooltipContent>
         </Tooltip>
       </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
-          <Input
-            placeholder="Enter keywords (comma-separated)..."
-            value={keywords}
-            onChange={(e) => setKeywords(e.target.value)}
-            disabled={!enabled}
-          />
-          <Button
-            onClick={findHighlights}
-            disabled={!enabled}
-            className="w-full bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
-          >
-            Find Highlights
-          </Button>
+      <CardContent className="p-3 pt-0 flex-1 min-h-0 flex flex-col">
+        <div className="flex flex-1 min-h-0 flex-col gap-3">
+          <div className="flex gap-2">
+            <Input
+              className="h-9"
+              placeholder="Enter keywords (comma-separated)..."
+              value={keywords}
+              onChange={(e) => setKeywords(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && enabled) findHighlights();
+              }}
+              disabled={!enabled}
+            />
+            <Button
+              onClick={findHighlights}
+              disabled={!enabled}
+              className="h-9 shrink-0 bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
+            >
+              Find
+            </Button>
+          </div>
           {!enabled ? (
-            <div className="border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
+            <div className="flex flex-1 items-center justify-center border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
               <p className="text-gray-500 dark:text-gray-400 text-center">
                 Upload and process a video first to enable highlights
               </p>
             </div>
           ) : highlights.length > 0 ? (
-            <div className="border rounded-md p-3 bg-gray-50 dark:bg-gray-700 max-h-[240px] overflow-y-auto">
+            <div className="border rounded-md p-3 bg-gray-50 dark:bg-gray-700 max-h-[240px] md:max-h-none md:flex-1 md:min-h-0 overflow-y-auto">
               {highlights.map((highlight, index) => (
                 <button
                   key={index}
                   type="button"
                   onClick={() => onSeek(highlight.start)}
-                  className="block w-full text-left mb-2 last:mb-0 pb-2 border-b border-gray-200 dark:border-gray-600 last:border-b-0 hover:bg-purple-50 dark:hover:bg-gray-600 rounded-md p-1"
+                  className="block w-full text-left mb-2 last:mb-0 pb-2 border-b border-gray-200 dark:border-gray-600 last:border-b-0 hover:bg-violet-50 dark:hover:bg-gray-600 rounded-md p-1"
                 >
-                  <span className="text-sm font-medium text-purple-600 dark:text-purple-400 mr-2">
+                  <span className="text-sm font-medium text-violet-600 dark:text-violet-400 mr-2">
                     {fmtTime(highlight.start)} – {fmtTime(highlight.end)}
                   </span>
                   <span className="text-gray-700 dark:text-gray-200">
@@ -116,7 +122,7 @@ const HighlightsPanel = ({ transcript, onSeek }: HighlightsPanelProps) => {
               ))}
             </div>
           ) : (
-            <div className="border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
+            <div className="flex flex-1 items-center justify-center border border-dashed rounded-md border-gray-300 dark:border-gray-600 p-4">
               <p className="text-gray-500 dark:text-gray-400 text-center">
                 Enter keywords to find relevant segments
               </p>

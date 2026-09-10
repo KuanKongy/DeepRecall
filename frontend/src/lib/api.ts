@@ -2,36 +2,6 @@ import axios from "axios";
 
 export const DEFAULT_API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:10000";
 
-const SETTINGS_KEY = "deeprecall-settings";
-
-export interface ApiSettings {
-  apiUrl: string;
-}
-
-export function loadSettings(): ApiSettings {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      return { apiUrl: parsed.apiUrl || DEFAULT_API };
-    }
-  } catch {
-    /* storage unavailable or corrupt — fall through to defaults */
-  }
-  return { apiUrl: DEFAULT_API };
-}
-
-export function saveSettings(settings: ApiSettings): void {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    /* private browsing etc. — settings just won't persist */
-  }
-}
-
-// The base URL is read per request so the settings popover takes effect
-// immediately. This also lets the hosted UI target a Mac backend at
-// http://localhost:10000 (exempt from mixed-content blocking in Chrome/Firefox).
 // Prefer the server's own error message (rate limits, validation) over
 // axios's generic "Request failed with status code N".
 export function errorMessage(err: unknown, fallback: string): string {
@@ -42,11 +12,13 @@ export function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
 }
 
-export const api = axios.create();
-api.interceptors.request.use((config) => {
-  config.baseURL = loadSettings().apiUrl;
-  return config;
-});
+export const api = axios.create({ baseURL: DEFAULT_API });
+
+// Playback fallback for direct links whose origin refuses inline playback
+// (octet-stream + nosniff): the server re-streams them with a video type.
+export function mediaProxyUrl(url: string): string {
+  return `${DEFAULT_API}/media/by-url?url=${encodeURIComponent(url)}`;
+}
 
 export interface TranscriptSegment {
   start: number;

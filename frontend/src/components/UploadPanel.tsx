@@ -7,9 +7,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { HealthInfo } from "@/lib/api";
 
 const BACKEND_LABELS: Record<string, string> = {
-  api: "API — fast (OpenRouter)",
-  mlx: "Local — MacBook GPU (MLX)",
-  local: "Local — CPU (faster-whisper)",
+  api: "API, fast (OpenRouter)",
+  mlx: "Local, MacBook GPU (MLX)",
+  local: "Local, CPU (faster-whisper)",
 };
 
 export const DEMO_URL =
@@ -59,7 +59,7 @@ const UploadPanel = ({
       onClick={() => setMode(value)}
       className={`flex flex-1 items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-sm transition-colors ${
         mode === value
-          ? "bg-purple-600 text-white"
+          ? "bg-purple-600 text-white dark:bg-purple-800"
           : "bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
       }`}
     >
@@ -69,77 +69,90 @@ const UploadPanel = ({
 
   return (
     <Card className="shadow-lg backdrop-blur-sm bg-white/90 dark:bg-gray-800/90">
-      <CardHeader className="pb-2">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <CardTitle className="text-xl flex items-center gap-2 cursor-help">
-              <FileVideo className="h-5 w-5" /> Add a Video
-            </CardTitle>
-          </TooltipTrigger>
-          <TooltipContent className="max-w-xs">
-            Upload a video or paste a link; DeepRecall transcribes, summarizes, and indexes it for search.
-          </TooltipContent>
-        </Tooltip>
+      <CardHeader className="p-3">
+        <div className="flex items-center justify-between gap-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <CardTitle className="text-lg flex items-center gap-2 cursor-help">
+                <FileVideo className="h-5 w-5" /> Add a Video
+              </CardTitle>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              Upload a video or paste a link; DeepRecall transcribes, summarizes, and indexes it for search.
+            </TooltipContent>
+          </Tooltip>
+          <div className="flex items-center gap-2">
+            {precached && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex shrink-0 items-center gap-1 rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700 dark:bg-green-900/60 dark:text-green-300">
+                    <CheckCircle2 className="h-3.5 w-3.5" /> Already processed
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>Results load instantly, no upload needed.</TooltipContent>
+              </Tooltip>
+            )}
+            <button
+              type="button"
+              disabled={loading || !serverReady}
+              onClick={() => {
+                setMode("link");
+                setUrl(DEMO_URL);
+                onProcessUrl(DEMO_URL);
+              }}
+              className="shrink-0 text-sm font-medium text-violet-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-violet-400"
+            >
+              Try a demo
+            </button>
+          </div>
+        </div>
       </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
+      <CardContent className="p-3 pt-0">
+        <div className="space-y-3">
           <div className="flex gap-2">
             {modeButton("file", <FileVideo className="h-4 w-4" />, "Upload file")}
             {modeButton("link", <LinkIcon className="h-4 w-4" />, "From link")}
           </div>
 
           {mode === "file" ? (
-            <div className="grid w-full items-center gap-1.5">
-              <Input
+            <div className="grid w-full items-center">
+              <input
                 id="video-upload"
                 type="file"
                 accept="video/*"
                 onChange={onFileChange}
-                className="cursor-pointer"
+                onClick={(e) => {
+                  // Re-picking the same file should refire onChange.
+                  (e.currentTarget as HTMLInputElement).value = "";
+                }}
+                className="peer sr-only"
               />
-              {video ? (
-                <p className="text-sm text-gray-700 dark:text-gray-300">
-                  {video.name} · {(video.size / 1e6).toFixed(1)} MB
-                </p>
-              ) : (
-                <p className="text-sm text-gray-500 dark:text-gray-400">
-                  MP4, MOV, WebM or MKV
-                </p>
-              )}
-              {precached && (
-                <p className="flex items-center gap-1.5 text-sm text-green-700 dark:text-green-400">
-                  <CheckCircle2 className="h-4 w-4" />
-                  Already processed — results load instantly
-                </p>
-              )}
+              <label
+                htmlFor="video-upload"
+                className="flex h-10 w-full cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-3 text-sm peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2"
+              >
+                {video ? (
+                  <span className="truncate text-gray-900 dark:text-gray-100">
+                    {video.name} · {(video.size / 1e6).toFixed(1)} MB
+                  </span>
+                ) : (
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Choose a video (MP4, MOV, WebM, MKV)
+                  </span>
+                )}
+              </label>
             </div>
           ) : (
-            <div className="grid w-full items-center gap-1.5">
-              <Input
-                placeholder="YouTube, Google Drive, or direct video URL"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && url.trim() && serverReady && !loading) {
-                    onProcessUrl(url.trim());
-                  }
-                }}
-              />
-              <p className="text-sm text-gray-500 dark:text-gray-400">
-                The server downloads it for you — nothing to upload.{" "}
-                <button
-                  type="button"
-                  disabled={loading || !serverReady}
-                  onClick={() => {
-                    setUrl(DEMO_URL);
-                    onProcessUrl(DEMO_URL);
-                  }}
-                  className="font-medium text-purple-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-purple-400"
-                >
-                  Try a demo video
-                </button>
-              </p>
-            </div>
+            <Input
+              placeholder="YouTube, Google Drive, or direct video URL"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && url.trim() && serverReady && !loading) {
+                  onProcessUrl(url.trim());
+                }
+              }}
+            />
           )}
 
           {backendChoices.length > 1 && (
@@ -164,7 +177,7 @@ const UploadPanel = ({
 
           {health === null && (
             <div className="flex items-center justify-between gap-2 rounded-md border border-red-200 bg-red-50 p-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
-              <span>Server unreachable — check the API URL in settings.</span>
+              <span>Server unreachable. Is the backend running?</span>
               <Button variant="outline" size="sm" onClick={onRetryHealth} className="shrink-0">
                 <RefreshCw className="mr-1 h-3.5 w-3.5" /> Retry
               </Button>
@@ -192,6 +205,7 @@ const UploadPanel = ({
 
           {mode === "file" && (
             <Button
+              size="sm"
               onClick={onProcess}
               disabled={loading || !serverReady || !video}
               className="w-full bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
@@ -201,6 +215,7 @@ const UploadPanel = ({
           )}
           {mode === "link" && (
             <Button
+              size="sm"
               onClick={() => url.trim() && onProcessUrl(url.trim())}
               disabled={loading || !serverReady || !url.trim()}
               className="w-full bg-gradient-to-r from-green-400 to-green-600 hover:from-green-500 hover:to-green-700 text-white"
