@@ -28,7 +28,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 app = Flask(__name__)
-CORS(app, origins=os.getenv("CORS_ORIGINS", "*").split(","))
+CORS(app, origins=os.getenv("CORS_ORIGINS", "*").split(","),
+     allow_headers=["Content-Type", "X-Client-Id"], max_age=86400)
 # Oversized uploads get a 413 instead of filling the disk.
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_CONTENT_LENGTH", str(2 * 1024**3)))
 
@@ -175,8 +176,18 @@ DEFAULT_BACKEND = (
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))  # 3 hours
 
 # ---------------------------------------------------------------------------
-# Per-IP rate limit on the endpoints that spend model money. In-memory is
-# correct here for the same reason as the job registry: gunicorn --workers 1.
+# Layered rate limits on the endpoints that spend model money. Identity is
+# X-Client-Id (a random per-browser UUID plus a fingerprint hash), layered
+# with the network:
+#   d:<uuid>   personal quota — separates users behind one shared NAT
+#   ip:<ip>    velocity guard at several x one user — stops scripted bursts
+#              and fresh-UUID minting from a single address without starving
+#              a campus network
+#   g:         global budget — bounds total spend no matter how many IPs and
+#              identities an abuser controls
+# The fingerprint never limits (identical lab machines share one); it is
+# only logged on denials. In-memory is correct here for the same reason as
+# the job registry: gunicorn --workers 1.
 # ---------------------------------------------------------------------------
 
 RATE_LIMIT_JOBS_PER_HOUR = int(os.getenv("RATE_LIMIT_JOBS_PER_HOUR", "6"))   # 0 disables
@@ -190,62 +201,153 @@ RATE_LIMIT_SUMMARIES_PER_HOUR = int(
 RATE_LIMIT_SUMMARIES_PER_DAY = int(
     os.getenv("RATE_LIMIT_SUMMARIES_PER_DAY", str(2 * RATE_LIMIT_JOBS_PER_DAY))
 )
-# kind -> (per-hour limit, per-day limit, noun for the 429 message)
+# Per-IP velocity guard: the burst cap is an absolute count per 10 minutes
+# (doubled for summaries); hour and day are multiples of the per-device
+# quota, sized so many legitimate users behind one NAT don't starve.
+RATE_LIMIT_IP_BURST_10MIN = int(os.getenv("RATE_LIMIT_IP_BURST_10MIN", "6"))
+RATE_LIMIT_IP_HOUR_MULTIPLIER = int(os.getenv("RATE_LIMIT_IP_HOUR_MULTIPLIER", "4"))
+RATE_LIMIT_IP_DAY_MULTIPLIER = int(os.getenv("RATE_LIMIT_IP_DAY_MULTIPLIER", "8"))
+# Global budget: the wallet backstop a distributed abuser can't route
+# around. The hourly slice keeps one attack from burning the whole day's
+# budget in minutes.
+RATE_LIMIT_GLOBAL_ANALYSES_PER_HOUR = int(os.getenv("RATE_LIMIT_GLOBAL_ANALYSES_PER_HOUR", "20"))
+RATE_LIMIT_GLOBAL_ANALYSES_PER_DAY = int(os.getenv("RATE_LIMIT_GLOBAL_ANALYSES_PER_DAY", "100"))
+RATE_LIMIT_GLOBAL_SUMMARIES_PER_HOUR = int(os.getenv("RATE_LIMIT_GLOBAL_SUMMARIES_PER_HOUR", "40"))
+RATE_LIMIT_GLOBAL_SUMMARIES_PER_DAY = int(os.getenv("RATE_LIMIT_GLOBAL_SUMMARIES_PER_DAY", "200"))
+
+# kind -> (per-hour, per-day, global per-hour, global per-day, noun)
 _RATE_LIMITS = {
-    "analysis": (RATE_LIMIT_JOBS_PER_HOUR, RATE_LIMIT_JOBS_PER_DAY, "analyses"),
+    "analysis": (RATE_LIMIT_JOBS_PER_HOUR, RATE_LIMIT_JOBS_PER_DAY,
+                 RATE_LIMIT_GLOBAL_ANALYSES_PER_HOUR,
+                 RATE_LIMIT_GLOBAL_ANALYSES_PER_DAY, "analyses"),
     "summary": (RATE_LIMIT_SUMMARIES_PER_HOUR, RATE_LIMIT_SUMMARIES_PER_DAY,
-                "summary regenerations"),
+                RATE_LIMIT_GLOBAL_SUMMARIES_PER_HOUR,
+                RATE_LIMIT_GLOBAL_SUMMARIES_PER_DAY, "summary regenerations"),
 }
-_rate_buckets = {}  # (kind, ip) -> deque of claim timestamps
+_rate_buckets = {}  # (kind, layer key) -> deque of claim timestamps
 _rate_lock = threading.Lock()
+_WINDOW_NAMES = {600: "burst", 3600: "hour", 86400: "day"}
+
+# UUID dot 64-hex fingerprint hash, as built by frontend/src/lib/clientId.ts.
+_CLIENT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[0-9a-f]{64}$"
+)
 
 
 def _client_ip():
+    """Rightmost X-Forwarded-For entry — appended by the platform edge, the
+    one hop a client can't spoof (the leftmost values are client-supplied).
+    IPv6 collapses to its /64 (one subscriber line) so address rotation
+    doesn't mint fresh buckets."""
     forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+    raw = forwarded.split(",")[-1].strip() if forwarded else (request.remote_addr or "unknown")
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return raw
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address)
+    return str(addr)
 
 
-def _claim_job_slot(ip, kind="analysis"):
-    """Take one slot of the given kind for this IP against both windows
-    (analyses: 6/hour, 12/day; summaries: 2x that, by default). Returns
-    (True, 0, None) when granted, else
-    (False, seconds_until_a_slot_frees, "hour"|"day")."""
-    per_hour, per_day, _ = _RATE_LIMITS[kind]
-    if per_hour <= 0 and per_day <= 0:
-        return True, 0, None
+def _client():
+    """(ip, device or None, fingerprint or None). Device and fingerprint come
+    from X-Client-Id; a missing or malformed header (curl, scripts) leaves
+    them None and the request falls to the strict bare-IP limits."""
+    ip = _client_ip()
+    raw = (request.headers.get("X-Client-Id") or "").strip().lower()
+    if _CLIENT_ID_RE.match(raw):
+        device, fp = raw.split(".", 1)
+        return ip, device, fp
+    return ip, None, None
+
+
+def _rate_layers(client, kind):
+    """The buckets one request claims, as (key, [(window seconds, cap), ...]).
+    Identified browsers: personal quota on the device UUID plus the loose
+    per-IP velocity guard. Headerless clients: the personal quota sits on the
+    bare IP instead (same bucket, stricter caps). Everyone shares the global
+    budget. A cap of 0 disables that window."""
+    per_hour, per_day, global_hour, global_day, _ = _RATE_LIMITS[kind]
+    ip, device, _fp = client
+    if device:
+        layers = [
+            ("d:" + device, [(3600, per_hour), (86400, per_day)]),
+            ("ip:" + ip, [
+                (600, RATE_LIMIT_IP_BURST_10MIN * (2 if kind == "summary" else 1)),
+                (3600, per_hour * RATE_LIMIT_IP_HOUR_MULTIPLIER),
+                (86400, per_day * RATE_LIMIT_IP_DAY_MULTIPLIER),
+            ]),
+        ]
+    else:
+        layers = [("ip:" + ip, [(3600, per_hour), (86400, per_day)])]
+    layers.append(("g:", [(3600, global_hour), (86400, global_day)]))
+    pruned = [
+        (key, [(window, cap) for window, cap in windows if cap > 0])
+        for key, windows in layers
+    ]
+    return [(key, windows) for key, windows in pruned if windows]
+
+
+def _claim_job_slot(client, kind="analysis"):
+    """Take one slot of the given kind in every applicable layer, or none at
+    all (check everything first, then append — no partial claims, so refunds
+    are symmetric). Returns (True, 0, None, None) when granted, else
+    (False, seconds_until_a_slot_frees, "burst"|"hour"|"day",
+    (blocking layer key, its cap))."""
+    layers = _rate_layers(client, kind)
+    if not layers:
+        return True, 0, None, None
     now = time.time()
     with _rate_lock:
-        bucket = _rate_buckets.setdefault((kind, ip), deque())
-        while bucket and now - bucket[0] > 86400:
-            bucket.popleft()
-        for stale in [key for key, entries in _rate_buckets.items() if not entries]:
-            if stale != (kind, ip):
-                del _rate_buckets[stale]
+        # Prune everything and drop empty buckets: blocked claims never
+        # allocate (below), and granted ones re-create theirs, so an empty
+        # bucket is always safe to delete.
+        for key in list(_rate_buckets):
+            entries = _rate_buckets[key]
+            while entries and now - entries[0] > 86400:
+                entries.popleft()
+            if not entries:
+                del _rate_buckets[key]
 
-        retry_after, scope = 0, None
-        hour_hits = [t for t in bucket if now - t <= 3600]
-        if per_hour > 0 and len(hour_hits) >= per_hour:
-            retry_after = int(hour_hits[0] + 3600 - now) + 1
-            scope = "hour"
-        if per_day > 0 and len(bucket) >= per_day:
-            day_wait = int(bucket[0] + 86400 - now) + 1
-            if day_wait > retry_after:
-                retry_after, scope = day_wait, "day"
-        if scope:
-            return False, retry_after, scope
+        retry_after, scope, blocked = 0, None, None
+        for layer_key, windows in layers:
+            bucket = _rate_buckets.get((kind, layer_key), ())
+            for window, cap in windows:
+                hits = [t for t in bucket if now - t <= window]
+                if len(hits) >= cap:
+                    wait = int(hits[0] + window - now) + 1
+                    if wait > retry_after:
+                        retry_after = wait
+                        scope = _WINDOW_NAMES.get(window, "hour")
+                        blocked = (layer_key, cap)
+        if blocked:
+            ip, device, fp = client
+            print(f"🚫 Rate limited: kind={kind} layer={blocked[0].split(':')[0]} "
+                  f"scope={scope} ip={ip} device={device or '-'} fp={(fp or '-')[:8]}")
+            return False, retry_after, scope, blocked
 
-        bucket.append(now)
-        return True, 0, None
+        for layer_key, _ in layers:
+            _rate_buckets.setdefault((kind, layer_key), deque()).append(now)
+        global_day = _RATE_LIMITS[kind][3]
+        if global_day > 0:
+            used = len(_rate_buckets.get((kind, "g:"), ()))
+            if used * 5 >= global_day * 4:
+                print(f"⚠️ Global budget: {used}/{global_day} "
+                      f"{_RATE_LIMITS[kind][4]} used in the last 24h")
+        return True, 0, None, None
 
 
-def _release_job_slot(ip, kind="analysis"):
-    """Give back a slot when no new work actually started (dedupe/error)."""
+def _release_job_slot(client, kind="analysis"):
+    """Give back one slot in every layer when no new work actually started
+    (dedupe/error/fully cached)."""
     with _rate_lock:
-        bucket = _rate_buckets.get((kind, ip))
-        if bucket:
-            bucket.pop()
+        for layer_key, _ in _rate_layers(client, kind):
+            bucket = _rate_buckets.get((kind, layer_key))
+            if bucket:
+                bucket.pop()
 
 
 def _fully_cached(video_key):
@@ -268,15 +370,22 @@ def _fmt_wait(seconds):
     return f"about {hours} hour" + ("s" if hours > 1 else "")
 
 
-def _rate_limited_response(retry_after, scope, kind="analysis"):
-    per_hour, per_day, noun = _RATE_LIMITS[kind]
-    limit = per_hour if scope == "hour" else per_day
-    per = "per hour" if scope == "hour" else "per day"
-    response = jsonify({
-        "error": f"Rate limit reached ({limit} {noun} {per}). "
-                 f"Try again in {_fmt_wait(retry_after)}.",
-        "retry_after": retry_after,
-    })
+def _rate_limited_response(retry_after, scope, kind="analysis", blocked=None):
+    """429 whose wording matches the blocking layer: personal quota, network
+    velocity guard, or the shared global budget."""
+    per_hour, per_day, _, _, noun = _RATE_LIMITS[kind]
+    layer = blocked[0].split(":")[0] if blocked else "d"
+    wait = _fmt_wait(retry_after)
+    if layer == "g":
+        span = "for the hour" if scope == "hour" else "for the day"
+        message = f"DeepRecall has reached its shared capacity {span}. Try again in {wait}."
+    elif layer == "ip":
+        message = f"Lots of traffic from your network right now — try again in {wait}."
+    else:
+        limit = blocked[1] if blocked else (per_hour if scope == "hour" else per_day)
+        per = "per hour" if scope == "hour" else "per day"
+        message = f"Rate limit reached ({limit} {noun} {per}). Try again in {wait}."
+    response = jsonify({"error": message, "retry_after": retry_after})
     response.status_code = 429
     response.headers["Retry-After"] = str(retry_after)
     return response
@@ -1138,10 +1247,10 @@ def process_video():
     if client_hash and not SHA256_RE.match(client_hash):
         return jsonify({"error": "video_hash must be a 64-char hex SHA-256."}), 400
 
-    ip = _client_ip()
-    allowed, retry_after, scope = _claim_job_slot(ip)
+    client = _client()
+    allowed, retry_after, scope, blocked = _claim_job_slot(client)
     if not allowed:
-        return _rate_limited_response(retry_after, scope)
+        return _rate_limited_response(retry_after, scope, blocked=blocked)
 
     workdir = tempfile.mkdtemp(prefix="deeprecall-")
     try:
@@ -1159,14 +1268,14 @@ def process_video():
         if deduplicated or _fully_cached(video_key):
             # Attached to a running job, or every stage is a cache hit:
             # no model money is spent, so give the slot back.
-            _release_job_slot(ip)
+            _release_job_slot(client)
         return jsonify({
             "job_id": job_id,
             "video_hash": video_key,
             "deduplicated": deduplicated,
         }), 202
     except Exception as e:
-        _release_job_slot(ip)
+        _release_job_slot(client)
         shutil.rmtree(workdir, ignore_errors=True)
         print(f"❌ Error accepting upload: {e}")
         return jsonify({"error": f"Failed to accept upload: {e}"}), 500
@@ -1188,10 +1297,10 @@ def process_url():
                      f"Available: {', '.join(AVAILABLE_BACKENDS) or 'none'}"
         }), 400
 
-    ip = _client_ip()
-    allowed, retry_after, scope = _claim_job_slot(ip)
+    client = _client()
+    allowed, retry_after, scope, blocked = _claim_job_slot(client)
     if not allowed:
-        return _rate_limited_response(retry_after, scope)
+        return _rate_limited_response(retry_after, scope, blocked=blocked)
 
     workdir = tempfile.mkdtemp(prefix="deeprecall-")
     try:
@@ -1205,10 +1314,10 @@ def process_url():
             known_raw.decode() if isinstance(known_raw, bytes) else known_raw
         ) if known_raw else None
         if deduplicated or (known_sha and _fully_cached(f"{known_sha}:{backend}")):
-            _release_job_slot(ip)
+            _release_job_slot(client)
         return jsonify({"job_id": job_id, "deduplicated": deduplicated}), 202
     except Exception as e:
-        _release_job_slot(ip)
+        _release_job_slot(client)
         shutil.rmtree(workdir, ignore_errors=True)
         print(f"❌ Error accepting URL: {e}")
         return jsonify({"error": f"Failed to accept URL: {e}"}), 500
@@ -1227,10 +1336,10 @@ def resummarize():
     if not transcript_raw:
         return jsonify({"error": "Transcript expired. Re-process the video first."}), 404
 
-    ip = _client_ip()
-    allowed, retry_after, scope = _claim_job_slot(ip, "summary")
+    client = _client()
+    allowed, retry_after, scope, blocked = _claim_job_slot(client, "summary")
     if not allowed:
-        return _rate_limited_response(retry_after, scope, "summary")
+        return _rate_limited_response(retry_after, scope, "summary", blocked)
     try:
         transcript = json.loads(transcript_raw)
         short_summary, detailed_summary = summarize_text(transcript)
@@ -1238,7 +1347,7 @@ def resummarize():
         cache.setex(f"summary:{video_key}", CACHE_TTL, json.dumps(summary))
         return jsonify({"summary": summary})
     except Exception as e:
-        _release_job_slot(ip, "summary")
+        _release_job_slot(client, "summary")
         print(f"❌ Error regenerating summary: {e}")
         return jsonify({"error": f"Failed to regenerate summary: {e}"}), 500
 

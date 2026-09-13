@@ -34,7 +34,9 @@ Copy `.env.sample` to `.env` and fill in:
 | `TRANSCRIBE_MAX_WORKERS` | Parallel chunk uploads per job on the `api` backend (default 6) |
 | `MLX_VAD_GAP_SECONDS` | `mlx` backend cuts clips only inside silences at least this long (default 5) |
 | `LOCAL_CPU_THREADS` | CPU threads for the `local` backend (default 0 = CTranslate2 default) |
-| `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY` | Per-IP analyses (defaults 10/hour, 20/day; 0 disables) |
+| `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY` | Personal analysis quota per browser (defaults 6/hour, 12/day; 0 disables) |
+| `RATE_LIMIT_IP_BURST_10MIN` / `RATE_LIMIT_IP_HOUR_MULTIPLIER` / `RATE_LIMIT_IP_DAY_MULTIPLIER` | Per-IP velocity guard: burst per 10 min (default 6) and hour/day caps as multiples of the personal quota (4x / 8x) |
+| `RATE_LIMIT_GLOBAL_ANALYSES_PER_HOUR` / `RATE_LIMIT_GLOBAL_ANALYSES_PER_DAY` | Global budget across all users (defaults 20/hour, 100/day; summaries have 2x equivalents) |
 | `MAX_DURATION_SECONDS` | Longest accepted video (default 10800 = 3 h) |
 | `CORS_ORIGINS` | Comma-separated origin allowlist (include the custom Pages domain) |
 

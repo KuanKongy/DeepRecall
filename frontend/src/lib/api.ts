@@ -1,4 +1,5 @@
 import axios from "axios";
+import { clientId } from "./clientId";
 
 export const DEFAULT_API = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:10000";
 
@@ -13,6 +14,19 @@ export function errorMessage(err: unknown, fallback: string): string {
 }
 
 export const api = axios.create({ baseURL: DEFAULT_API });
+
+// The rate-limited endpoints are all POSTs; skipping GETs keeps the 2s
+// /jobs polling a simple request (no CORS preflight per poll).
+api.interceptors.request.use(async (config) => {
+  if (config.method === "post") {
+    try {
+      config.headers["X-Client-Id"] = await clientId();
+    } catch {
+      // Without the header the server just applies its strict IP-only limits.
+    }
+  }
+  return config;
+});
 
 // Playback fallback for direct links whose origin refuses inline playback
 // (octet-stream + nosniff): the server re-streams them with a video type.

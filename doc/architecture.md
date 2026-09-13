@@ -197,24 +197,53 @@ its entries (the benchmark above ran against the live instance this way).
 
 ## Abuse limits
 
-The app is open — no accounts, no password. Spend is bounded instead:
+The app is open — no accounts, no password. Spend is bounded instead by a
+layered rate limit on the endpoints that cost model money, designed for the
+actual audience: students behind one campus NAT on near-identical laptops.
+"One limit per IP" fails that population (everyone shares a bucket), and a
+fingerprint limit fails it too (identical hardware + browser + locale =
+one fingerprint for the whole class), so identity is layered:
 
-- A per-IP rate limit — a burst window and a daily cap — on the endpoints
-  that cost model money, with two separate buckets: analyses (defaults 6/hour
-  and 12/day, `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY`) cover
-  `/process_video` and `/process_url`, while `/resummarize` draws from its own
-  2x-larger allowance (defaults 12/hour and 24/day,
-  `RATE_LIMIT_SUMMARIES_PER_HOUR` / `RATE_LIMIT_SUMMARIES_PER_DAY`) — a
+- **Personal quota** — the browser sends `X-Client-Id: <uuid>.<sha256>`
+  (a random UUID persisted in localStorage plus a device-traits hash) on
+  every POST, and analyses are limited per UUID (defaults 6/hour and
+  12/day, `RATE_LIMIT_JOBS_PER_HOUR` / `RATE_LIMIT_JOBS_PER_DAY`), so
+  people sharing a network each get their own allowance. `/resummarize`
+  draws from its own 2x-larger allowance
+  (`RATE_LIMIT_SUMMARIES_PER_HOUR` / `RATE_LIMIT_SUMMARIES_PER_DAY`) — a
   regeneration is a single gpt-4.1-nano call, ~30x cheaper than a
   transcription-dominated analysis, so analyses remain ~95% of worst-case
-  spend. Only requests that actually spend model money consume a slot:
-  attaching to an already-running job or re-processing a video whose
-  transcript, summary and search index are all still cached releases the
-  slot. A 429 carries `retry_after` seconds and a Retry-After header, and
-  the UI tells the user how long to wait; searches and polling are
-  unlimited. In-memory, which is correct under the single-worker
-  deployment; the client IP comes from `X-Forwarded-For` behind the
-  platform proxy.
+  spend. Requests without a well-formed header (curl, scripts) get these
+  same base limits keyed on the bare IP — stricter, never looser.
+- **Per-IP velocity guard**, several times one user's quota rather than a
+  quota itself: `RATE_LIMIT_IP_BURST_10MIN` distinct analyses per 10
+  minutes (default 6, doubled for summaries), then hour/day caps at
+  `RATE_LIMIT_IP_HOUR_MULTIPLIER` (4x) / `RATE_LIMIT_IP_DAY_MULTIPLIER`
+  (8x) the personal quota. It stops scripted hammering and fresh-UUID
+  minting from one address while leaving a whole campus usable.
+- **Global budget** across all users — the wallet backstop that distributed
+  abuse can't route around: `RATE_LIMIT_GLOBAL_ANALYSES_PER_HOUR` /
+  `_PER_DAY` (defaults 20 and 100; summaries 2x). The hourly slice keeps an
+  attack from draining the whole day's budget at once, and the log warns
+  from 80% of the daily budget.
+- The **fingerprint hash never limits** — on this population it would
+  collide across legitimate users — but it is logged alongside IP and UUID
+  on every denial, so "many UUIDs, one fingerprint, one IP" abuse is
+  visible in the logs. If scripted abuse ever materializes, the escalation
+  path is an invisible Cloudflare Turnstile check on submission, not
+  tighter identity limits.
+
+A slot is claimed in every layer atomically or not at all, and only
+requests that actually spend model money keep their slot: attaching to an
+already-running job or re-processing a fully cached video refunds all
+layers, so a classroom analyzing the same lecture video costs the limiter
+almost nothing. A 429 carries `retry_after` seconds, a Retry-After header
+and wording that names the blocking layer (personal, network, or shared
+capacity); searches and polling are unlimited. Counters are in-memory,
+which is correct under the single-worker deployment. The client IP is the
+*rightmost* `X-Forwarded-For` entry — the hop appended by the platform
+edge, since leftmost values are client-supplied — with IPv6 collapsed to
+its /64 so address rotation doesn't mint fresh buckets.
 - Videos longer than `MAX_DURATION_SECONDS` (default 3 h) are rejected after
   audio extraction, and yt-dlp filters them out before downloading.
 - `MAX_CONTENT_LENGTH` (default 2 GB) turns oversized uploads into a 413
